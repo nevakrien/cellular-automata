@@ -4,118 +4,83 @@ use std::time::Instant;
 use egui_wgpu::wgpu;
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use egui_winit::winit::application::ApplicationHandler;
-use egui_winit::winit::dpi::PhysicalSize;
 use egui_winit::winit::event::{ElementState, KeyEvent, WindowEvent};
 use egui_winit::winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use egui_winit::winit::keyboard::{Key, NamedKey};
 use egui_winit::winit::window::{Window, WindowId};
-use wgpu::util::DeviceExt;
 
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct ShaderUniforms {
-    time: f32,
-    intensity: f32,
+mod rps;
+
+use rps::{GridSize, RpsShaders};
+
+const GRID_SIZE: GridSize = GridSize {
+    width: 512,
+    height: 512,
+};
+
+struct Simulation {
+    shaders: RpsShaders,
+    size: GridSize,
+    running: bool,
+    step_once: bool,
+    steps_per_frame: u32,
+    generation: u64,
+    frame_time_ms: f32,
+    last_frame: Instant,
 }
 
-struct FullscreenShader {
-    pipeline: wgpu::RenderPipeline,
-    uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-    start_time: Instant,
-    intensity: f32,
-}
-
-impl FullscreenShader {
+impl Simulation {
     fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
-        let uniforms = ShaderUniforms {
-            time: 0.0,
-            intensity: 0.7,
-        };
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("shader uniforms"),
-            contents: bytemuck::bytes_of(&uniforms),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shader uniforms layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shader uniforms bind group"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("fullscreen shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("fullscreen.wgsl").into()),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shader pipeline layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("fullscreen shader pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let contents = initial_board(GRID_SIZE);
+        let shaders = RpsShaders::new(device, GRID_SIZE, &contents, surface_format);
 
         Self {
-            pipeline,
-            uniform_buffer,
-            bind_group,
-            start_time: Instant::now(),
-            intensity: uniforms.intensity,
+            shaders,
+            size: GRID_SIZE,
+            running: true,
+            step_once: false,
+            steps_per_frame: 1,
+            generation: 0,
+            frame_time_ms: 0.0,
+            last_frame: Instant::now(),
         }
     }
 
-    fn update_uniforms(&self, queue: &wgpu::Queue) {
-        let uniforms = ShaderUniforms {
-            time: self.start_time.elapsed().as_secs_f32(),
-            intensity: self.intensity,
-        };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+    fn begin_frame(&mut self) {
+        let now = Instant::now();
+        self.frame_time_ms = (now - self.last_frame).as_secs_f32() * 1_000.0;
+        self.last_frame = now;
     }
 
-    fn render(&self, render_pass: &mut wgpu::RenderPass<'_>) {
-        render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, &self.bind_group, &[]);
-        render_pass.draw(0..3, 0..1);
+    fn queued_steps(&mut self) -> u32 {
+        if self.running {
+            self.steps_per_frame
+        } else if self.step_once {
+            self.step_once = false;
+            1
+        } else {
+            0
+        }
     }
+}
+
+fn initial_board(size: GridSize) -> Vec<u32> {
+    let mut board = Vec::with_capacity(size.width as usize * size.height as usize);
+
+    for y in 0..size.height {
+        for x in 0..size.width {
+            let quadrant = (x >= size.width / 2) as u32 + 2 * (y >= size.height / 2) as u32;
+            let noise = ((x.wrapping_mul(73_856_093)) ^ (y.wrapping_mul(19_349_663))) % 17;
+            let cell = match (quadrant + noise) % 3 {
+                0 => 1,
+                1 => 2,
+                _ => 3,
+            };
+            board.push(cell);
+        }
+    }
+
+    board
 }
 
 struct GpuState {
@@ -126,7 +91,8 @@ struct GpuState {
     egui_context: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: Renderer,
-    shader: FullscreenShader,
+
+    simulation: Simulation,
 }
 
 impl GpuState {
@@ -160,7 +126,7 @@ impl GpuState {
             .unwrap_or(surface_caps.formats[0]);
 
         let size = window.inner_size();
-        let surface_config =  wgpu::SurfaceConfiguration {
+        let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width.max(1),
@@ -170,13 +136,12 @@ impl GpuState {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-    
 
         surface.configure(&device, &surface_config);
 
         let (egui_context, egui_state, egui_renderer) =
             Self::create_egui(&window, &device, surface_config.format);
-        let shader = FullscreenShader::new(&device, surface_config.format);
+        let simulation = Simulation::new(&device, surface_config.format);
 
         Ok(Self {
             surface,
@@ -186,11 +151,9 @@ impl GpuState {
             egui_context,
             egui_state,
             egui_renderer,
-            shader,
+            simulation,
         })
     }
-
-
 
     fn create_egui(
         window: &Window,
@@ -234,20 +197,66 @@ impl GpuState {
     fn run_hud(&mut self, window: &Window) -> egui::FullOutput {
         let raw_input = self.egui_state.take_egui_input(window);
         self.egui_context.run(raw_input, |ctx| {
-            Self::draw_hud(ctx, &mut self.shader);
+            Self::draw_hud(ctx, &mut self.simulation);
         })
     }
 
-    fn draw_hud(ctx: &egui::Context, shader: &mut FullscreenShader) {
-        egui::Window::new("Shader controls").show(ctx, |ui| {
-            ui.label("This egui window is drawn over a custom WGSL shader pass.");
-            ui.add(egui::Slider::new(&mut shader.intensity, 0.0..=1.0).text("shader intensity"));
-        });
+    fn draw_hud(ctx: &egui::Context, simulation: &mut Simulation) {
+        egui::Window::new("Rock Paper Scissors")
+            .default_pos([12.0, 12.0])
+            .show(ctx, |ui| {
+                ui.label("GPU cellular automaton");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let label = if simulation.running { "Pause" } else { "Run" };
+                    if ui.button(label).clicked() {
+                        simulation.running = !simulation.running;
+                    }
+
+                    if ui
+                        .add_enabled(!simulation.running, egui::Button::new("Step"))
+                        .clicked()
+                    {
+                        simulation.step_once = true;
+                    }
+                });
+
+                ui.add(
+                    egui::Slider::new(&mut simulation.steps_per_frame, 1..=128)
+                        .text("steps / frame"),
+                );
+
+                ui.separator();
+                ui.label(format!(
+                    "Grid: {} x {} cells",
+                    simulation.size.width, simulation.size.height
+                ));
+                ui.label(format!("Generation: {}", simulation.generation));
+                ui.label(format!("Frame: {:.2} ms", simulation.frame_time_ms));
+                ui.label("Red = rock, green = paper, blue = scissors");
+            });
     }
 
-    fn render_shader_pass(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+    fn run_simulation_steps(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let steps = self.simulation.queued_steps();
+        if steps == 0 {
+            return;
+        }
+
+        for _ in 0..steps {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rps compute pass"),
+                timestamp_writes: None,
+            });
+            self.simulation.shaders.compute_step(&mut compute_pass);
+        }
+
+        self.simulation.generation += u64::from(steps);
+    }
+
+    fn render_simulation_pass(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("shader pass"),
+            label: Some("rps render pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,
@@ -261,7 +270,7 @@ impl GpuState {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        self.shader.render(&mut render_pass);
+        self.simulation.shaders.render(&mut render_pass);
     }
 
     fn render_egui_pass(
@@ -308,10 +317,10 @@ impl GpuState {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        self.simulation.begin_frame();
         let full_output = self.run_hud(window);
         self.egui_state
             .handle_platform_output(window, full_output.platform_output);
-        self.shader.update_uniforms(&self.queue);
 
         for (texture_id, image_delta) in &full_output.textures_delta.set {
             self.egui_renderer
@@ -340,7 +349,8 @@ impl GpuState {
             &screen_descriptor,
         );
 
-        self.render_shader_pass(&mut encoder, &view);
+        self.run_simulation_steps(&mut encoder);
+        self.render_simulation_pass(&mut encoder, &view);
         self.render_egui_pass(&mut encoder, &view, &paint_jobs, &screen_descriptor);
 
         for texture_id in &full_output.textures_delta.free {
