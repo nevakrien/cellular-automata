@@ -42,6 +42,9 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     if(y>params.width){
         return;
     }
+    if(input_grid[id.x]==0){
+        return;
+    }
 
     output_grid[id.x]=input_grid[id.x];
     
@@ -58,11 +61,14 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
             let other_idx = u32(new_x)+u32(new_y)*params.width;
 
-            score +=compute_rps(input_grid[id.x],input_grid[other_idx]);
+            let ans = compute_rps(input_grid[id.x],input_grid[other_idx]);
+            if(ans>0){
+                score += ans;
+            }
         }
     }
 
-    if(score<2){
+    if(score<3){
         return;
     }
 

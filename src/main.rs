@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use egui_wgpu::wgpu;
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
@@ -23,26 +23,35 @@ struct Simulation {
     size: GridSize,
     running: bool,
     step_once: bool,
-    steps_per_frame: u32,
+    target_steps_per_second: f32,
+    measured_steps_per_second: f32,
+    steps_in_sample: u32,
     generation: u64,
     frame_time_ms: f32,
     last_frame: Instant,
+    next_step_at: Instant,
+    step_sample_started_at: Instant,
 }
 
 impl Simulation {
     fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let contents = initial_board(GRID_SIZE);
         let shaders = RpsShaders::new(device, GRID_SIZE, &contents, surface_format);
+        let now = Instant::now();
 
         Self {
             shaders,
             size: GRID_SIZE,
             running: true,
             step_once: false,
-            steps_per_frame: 1,
+            target_steps_per_second: 30.0,
+            measured_steps_per_second: 0.0,
+            steps_in_sample: 0,
             generation: 0,
             frame_time_ms: 0.0,
-            last_frame: Instant::now(),
+            last_frame: now,
+            next_step_at: now,
+            step_sample_started_at: now,
         }
     }
 
@@ -52,14 +61,34 @@ impl Simulation {
         self.last_frame = now;
     }
 
-    fn queued_steps(&mut self) -> u32 {
-        if self.running {
-            self.steps_per_frame
-        } else if self.step_once {
+    fn step_interval(&self) -> Duration {
+        Duration::from_secs_f32(1.0 / self.target_steps_per_second.max(1.0))
+    }
+
+    fn wants_step(&self, now: Instant) -> bool {
+        self.step_once || (self.running && now >= self.next_step_at)
+    }
+
+    fn record_step(&mut self, now: Instant) {
+        if self.step_once {
             self.step_once = false;
-            1
+        }
+
+        self.generation += 1;
+        self.steps_in_sample += 1;
+
+        let sample_time = now - self.step_sample_started_at;
+        if sample_time >= Duration::from_secs(1) {
+            self.measured_steps_per_second =
+                self.steps_in_sample as f32 / sample_time.as_secs_f32();
+            self.steps_in_sample = 0;
+            self.step_sample_started_at = now;
+        }
+
+        if self.running {
+            self.next_step_at = now + self.step_interval();
         } else {
-            0
+            self.next_step_at = now;
         }
     }
 }
@@ -222,8 +251,8 @@ impl GpuState {
                 });
 
                 ui.add(
-                    egui::Slider::new(&mut simulation.steps_per_frame, 1..=128)
-                        .text("steps / frame"),
+                    egui::Slider::new(&mut simulation.target_steps_per_second, 1.0..=240.0)
+                        .text("target steps / second"),
                 );
 
                 ui.separator();
@@ -232,18 +261,22 @@ impl GpuState {
                     simulation.size.width, simulation.size.height
                 ));
                 ui.label(format!("Generation: {}", simulation.generation));
+                ui.label(format!(
+                    "Steps: {:.1} / second",
+                    simulation.measured_steps_per_second
+                ));
                 ui.label(format!("Frame: {:.2} ms", simulation.frame_time_ms));
                 ui.label("Red = rock, green = paper, blue = scissors");
             });
     }
 
-    fn run_simulation_steps(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        let steps = self.simulation.queued_steps();
-        if steps == 0 {
-            return;
-        }
-
-        for _ in 0..steps {
+    fn run_simulation_step(&mut self) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("simulation step encoder"),
+            });
+        {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("rps compute pass"),
                 timestamp_writes: None,
@@ -251,7 +284,8 @@ impl GpuState {
             self.simulation.shaders.compute_step(&mut compute_pass);
         }
 
-        self.simulation.generation += u64::from(steps);
+        self.queue.submit(Some(encoder.finish()));
+        self.simulation.record_step(Instant::now());
     }
 
     fn render_simulation_pass(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
@@ -349,7 +383,6 @@ impl GpuState {
             &screen_descriptor,
         );
 
-        self.run_simulation_steps(&mut encoder);
         self.render_simulation_pass(&mut encoder, &view);
         self.render_egui_pass(&mut encoder, &view, &paint_jobs, &screen_descriptor);
 
@@ -421,23 +454,35 @@ impl ApplicationHandler for App {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.render(window);
                 }
-                window.request_redraw();
             }
-            _ if consumed_by_egui => {}
+            _ if consumed_by_egui => window.request_redraw(),
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = self.window.as_ref() {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let (Some(window), Some(gpu)) = (self.window.as_ref(), self.gpu.as_mut()) else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        };
+
+        let now = Instant::now();
+        if gpu.simulation.wants_step(now) {
+            gpu.run_simulation_step();
             window.request_redraw();
+        }
+
+        if gpu.simulation.running {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(gpu.simulation.next_step_at));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App::default();
     event_loop.run_app(&mut app)?;
