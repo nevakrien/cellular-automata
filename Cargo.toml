@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.102"
+bytemuck = { version = "1.24.0", features = ["derive"] }
 egui = "0.33.3"
 egui-wgpu = "0.33.3"
 egui-winit = "0.33.3"
+pollster = "0.4.0"
