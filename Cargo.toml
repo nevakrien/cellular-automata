@@ -1,0 +1,9 @@
+[package]
+name = "cellular-automata"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+egui = "0.33.3"
+egui-wgpu = "0.33.3"
+egui-winit = "0.33.3"
