@@ -847,7 +847,7 @@ impl GpuState {
     ) -> HudAction {
         let mut action = HudAction::default();
 
-        egui::Window::new("GPU Cellular Automaton")
+        egui::Window::new("")
             .default_open(false)
             .default_pos([12.0, 12.0])
             .show(ctx, |ui| {
