@@ -756,6 +756,7 @@ impl App {
         }
     }
 
+    #[inline(always)]
     fn tick_and_render(&mut self, window: &Window) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -835,14 +836,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let Some(gpu) = self.gpu.as_mut() else {
-                    return;
-                };
-
-                let now = Instant::now();
-                gpu.update_keyboard_navigation(now);
-                gpu.run_due_simulation_steps(now);
-                gpu.render(&window);
+                self.tick_and_render(window.as_ref());
             }
             _ => {}
         }
