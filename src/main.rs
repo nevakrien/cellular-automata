@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -6,13 +7,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use egui_wgpu::wgpu;
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use egui_winit::winit::application::ApplicationHandler;
-use egui_winit::winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use egui_winit::winit::event::{
+    ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use egui_winit::winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use egui_winit::winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+use egui_winit::winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use egui_winit::winit::window::{Window, WindowId};
 
+mod brush;
 mod pipelines;
 
+use brush::{BrushEdit, BrushStroke, MAX_BRUSH_EDITS};
 use pipelines::{GameMode, ScreenSize, Shaders};
 
 const GRID_SIZE: ScreenSize = ScreenSize {
@@ -65,6 +70,12 @@ struct Simulation {
     show_steps_counter: bool,
     next_step_at: Instant,
     step_sample_started_at: Instant,
+    brush_value: u32,
+    brush_radius: u32,
+    brush_down: bool,
+    last_brush_cell: Option<(u32, u32)>,
+    in_progress_brush_strokes: Vec<BrushStroke>,
+    undo_stack: Vec<BrushUndoUnit>,
 }
 
 struct FrameStats {
@@ -74,6 +85,16 @@ struct FrameStats {
     frame_time_ms: f32,
     measured_frames_per_second: f32,
     show_fps_counter: bool,
+}
+
+#[derive(Default)]
+struct HudAction {
+    reset_requested: bool,
+    undo_requested: bool,
+}
+
+struct BrushUndoUnit {
+    strokes: Vec<BrushStroke>,
 }
 
 impl FrameStats {
@@ -140,6 +161,12 @@ impl Simulation {
             show_steps_counter: false,
             next_step_at: now,
             step_sample_started_at: now,
+            brush_value: 1,
+            brush_radius: 4,
+            brush_down: false,
+            last_brush_cell: None,
+            in_progress_brush_strokes: Vec::new(),
+            undo_stack: Vec::new(),
         }
     }
 
@@ -158,6 +185,10 @@ impl Simulation {
         self.measured_steps_per_second = 0.0;
         self.steps_in_sample = 0;
         self.generation = 0;
+        self.brush_down = false;
+        self.last_brush_cell = None;
+        self.in_progress_brush_strokes.clear();
+        self.undo_stack.clear();
         self.next_step_at = now;
         self.step_sample_started_at = now;
         println!(
@@ -283,6 +314,98 @@ impl Simulation {
     fn write_view(&self, queue: &wgpu::Queue) {
         self.shaders
             .set_view(queue, self.view_offset, self.view_scale);
+    }
+
+    fn cursor_cell(&self) -> Option<(u32, u32)> {
+        let cursor_uv = self.cursor_uv?;
+        let world_uv = [
+            self.view_offset[0] + cursor_uv[0] / self.view_scale,
+            self.view_offset[1] + cursor_uv[1] / self.view_scale,
+        ];
+
+        if !(0.0..1.0).contains(&world_uv[0]) || !(0.0..1.0).contains(&world_uv[1]) {
+            return None;
+        }
+
+        Some((
+            (world_uv[0] * self.size.width as f32) as u32,
+            (world_uv[1] * self.size.height as f32) as u32,
+        ))
+    }
+
+    fn brush_edits_between(&self, from: Option<(u32, u32)>, to: (u32, u32)) -> Vec<BrushEdit> {
+        let mut cells = HashSet::new();
+        if let Some(from) = from {
+            let mut x0 = from.0 as i32;
+            let mut y0 = from.1 as i32;
+            let x1 = to.0 as i32;
+            let y1 = to.1 as i32;
+            let dx = (x1 - x0).abs();
+            let sx = if x0 < x1 { 1 } else { -1 };
+            let dy = -(y1 - y0).abs();
+            let sy = if y0 < y1 { 1 } else { -1 };
+            let mut err = dx + dy;
+
+            loop {
+                self.insert_brush_cells((x0, y0), &mut cells);
+                if x0 == x1 && y0 == y1 {
+                    break;
+                }
+                let e2 = 2 * err;
+                if e2 >= dy {
+                    err += dy;
+                    x0 += sx;
+                }
+                if e2 <= dx {
+                    err += dx;
+                    y0 += sy;
+                }
+            }
+        } else {
+            self.insert_brush_cells((to.0 as i32, to.1 as i32), &mut cells);
+        }
+
+        cells
+            .into_iter()
+            .take(MAX_BRUSH_EDITS)
+            .map(|(x, y)| BrushEdit::new(x, y, self.brush_value))
+            .collect()
+    }
+
+    fn insert_brush_cells(&self, center: (i32, i32), cells: &mut HashSet<(u32, u32)>) {
+        let radius = self.brush_radius as i32;
+        let radius_squared = radius * radius;
+        for y in (center.1 - radius)..=(center.1 + radius) {
+            for x in (center.0 - radius)..=(center.0 + radius) {
+                let dx = x - center.0;
+                let dy = y - center.1;
+                if dx * dx + dy * dy > radius_squared {
+                    continue;
+                }
+                if x >= 0 && y >= 0 && x < self.size.width as i32 && y < self.size.height as i32 {
+                    cells.insert((x as u32, y as u32));
+                }
+            }
+        }
+    }
+
+    fn clear_undo(&mut self) {
+        self.in_progress_brush_strokes.clear();
+        self.undo_stack.clear();
+    }
+
+    fn finish_brush_unit(&mut self) {
+        if !self.in_progress_brush_strokes.is_empty() {
+            self.undo_stack.push(BrushUndoUnit {
+                strokes: std::mem::take(&mut self.in_progress_brush_strokes),
+            });
+        }
+    }
+
+    fn cancel_brush_unit(&mut self) {
+        self.brush_down = false;
+        self.last_brush_cell = None;
+        self.in_progress_brush_strokes.clear();
     }
 
     fn step_interval(&self) -> Duration {
@@ -652,21 +775,21 @@ impl GpuState {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    fn run_hud(&mut self, window: &Window) -> (egui::FullOutput, bool) {
+    fn run_hud(&mut self, window: &Window) -> (egui::FullOutput, HudAction) {
         let raw_input = self.egui_state.take_egui_input(window);
-        let mut reset_requested = false;
+        let mut action = HudAction::default();
         let output = self.egui_context.run(raw_input, |ctx| {
-            reset_requested = Self::draw_hud(ctx, &mut self.simulation, &mut self.frame_stats);
+            action = Self::draw_hud(ctx, &mut self.simulation, &mut self.frame_stats);
         });
-        (output, reset_requested)
+        (output, action)
     }
 
     fn draw_hud(
         ctx: &egui::Context,
         simulation: &mut Simulation,
         frame_stats: &mut FrameStats,
-    ) -> bool {
-        let mut reset_requested = false;
+    ) -> HudAction {
+        let mut action = HudAction::default();
 
         egui::Window::new("")
             .default_open(false)
@@ -692,13 +815,17 @@ impl GpuState {
                             );
                         });
                     if simulation.game_mode != old_mode {
-                        reset_requested = true;
+                        action.reset_requested = true;
                     }
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
                     let label = if simulation.running { "Pause" } else { "Run" };
                     if ui.button(label).clicked() {
+                        if !simulation.running {
+                            simulation.clear_undo();
+                            simulation.cancel_brush_unit();
+                        }
                         simulation.running = !simulation.running;
                     }
 
@@ -748,11 +875,11 @@ impl GpuState {
                         .add_enabled(seed_is_valid, egui::Button::new("Reset map"))
                         .clicked()
                     {
-                        reset_requested = true;
+                        action.reset_requested = true;
                     }
                     if ui.button("Random seed").clicked() {
                         simulation.pending_seed = random_seed().to_string();
-                        reset_requested = true;
+                        action.reset_requested = true;
                     }
                 });
                 if !seed_is_valid {
@@ -769,6 +896,58 @@ impl GpuState {
                     simulation.view_scale, simulation.view_offset[0], simulation.view_offset[1]
                 ));
                 ui.label("Mouse wheel zooms; WASD or arrows move the view");
+                ui.separator();
+                ui.label("Brush");
+                ui.add_enabled_ui(!simulation.running, |ui| {
+                    ui.add(egui::Slider::new(&mut simulation.brush_radius, 0..=128).text("radius"));
+                    match simulation.game_mode {
+                        GameMode::Rps => {
+                            egui::ComboBox::from_id_salt("brush_value")
+                                .selected_text(match simulation.brush_value {
+                                    0 => "Empty",
+                                    1 => "Rock",
+                                    2 => "Paper",
+                                    3 => "Scissors",
+                                    _ => "Invalid",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut simulation.brush_value, 0, "Empty");
+                                    ui.selectable_value(&mut simulation.brush_value, 1, "Rock");
+                                    ui.selectable_value(&mut simulation.brush_value, 2, "Paper");
+                                    ui.selectable_value(&mut simulation.brush_value, 3, "Scissors");
+                                });
+                        }
+                        GameMode::Life => {
+                            egui::ComboBox::from_id_salt("brush_value")
+                                .selected_text(if simulation.brush_value == 1 {
+                                    "Live"
+                                } else {
+                                    "Dead"
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut simulation.brush_value, 1, "Live");
+                                    ui.selectable_value(&mut simulation.brush_value, 2, "Dead");
+                                });
+                            if simulation.brush_value != 1 && simulation.brush_value != 2 {
+                                simulation.brush_value = 1;
+                            }
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            !simulation.undo_stack.is_empty(),
+                            egui::Button::new("Undo brush"),
+                        )
+                        .clicked()
+                    {
+                        action.undo_requested = true;
+                    }
+                });
+                if simulation.running {
+                    ui.label("Pause to paint; running clears brush undo history");
+                } else {
+                    ui.label("Left-drag paints into the simulation grid");
+                }
                 ui.label(format!("Generation: {}", simulation.generation));
                 ui.label(format!(
                     "Steps: {:.1} / second",
@@ -819,11 +998,25 @@ impl GpuState {
                 });
         }
 
-        reset_requested
+        action
     }
 
     fn reset_simulation(&mut self) {
         self.simulation.reset(&self.queue);
+    }
+
+    fn undo_brush(&mut self) {
+        let Some(unit) = self.simulation.undo_stack.pop() else {
+            return;
+        };
+        for stroke in unit.strokes.into_iter().rev() {
+            self.simulation.shaders.undo_brush_stroke(
+                &self.device,
+                &self.queue,
+                self.simulation.size,
+                stroke,
+            );
+        }
     }
 
     fn update_cursor_position(&mut self, position: egui_winit::winit::dpi::PhysicalPosition<f64>) {
@@ -832,6 +1025,47 @@ impl GpuState {
             self.surface_config.width,
             self.surface_config.height,
         );
+    }
+
+    fn set_brush_down(&mut self, down: bool) {
+        if self.simulation.running {
+            self.simulation.cancel_brush_unit();
+            return;
+        }
+
+        self.simulation.brush_down = down;
+        if down {
+            self.simulation.in_progress_brush_strokes.clear();
+            self.paint_at_cursor();
+        } else {
+            self.simulation.last_brush_cell = None;
+            self.simulation.finish_brush_unit();
+        }
+    }
+
+    fn paint_at_cursor(&mut self) {
+        if self.simulation.running || !self.simulation.brush_down {
+            return;
+        }
+        let Some(cell) = self.simulation.cursor_cell() else {
+            return;
+        };
+        if self.simulation.last_brush_cell == Some(cell) {
+            return;
+        }
+
+        let edits = self
+            .simulation
+            .brush_edits_between(self.simulation.last_brush_cell, cell);
+        self.simulation.last_brush_cell = Some(cell);
+        if let Some(stroke) = self.simulation.shaders.apply_brush_edits(
+            &self.device,
+            &self.queue,
+            self.simulation.size,
+            &edits,
+        ) {
+            self.simulation.in_progress_brush_strokes.push(stroke);
+        }
     }
 
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
@@ -952,12 +1186,15 @@ impl GpuState {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let (full_output, reset_requested) = self.run_hud(window);
+        let (full_output, action) = self.run_hud(window);
         self.egui_state
             .handle_platform_output(window, full_output.platform_output);
 
-        if reset_requested {
+        if action.reset_requested {
             self.reset_simulation();
+        }
+        if action.undo_requested {
+            self.undo_brush();
         }
 
         for (texture_id, image_delta) in &full_output.textures_delta.set {
@@ -1004,6 +1241,7 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     config: StartupConfig,
+    modifiers: ModifiersState,
 }
 
 impl App {
@@ -1012,6 +1250,7 @@ impl App {
             window: None,
             gpu: None,
             config,
+            modifiers: ModifiersState::default(),
         }
     }
 
@@ -1025,6 +1264,13 @@ impl App {
         gpu.update_keyboard_navigation(now);
         gpu.run_due_simulation_steps(now);
         gpu.render(window);
+    }
+
+    fn is_undo_shortcut(&self, event: &KeyEvent) -> bool {
+        event.state == ElementState::Pressed
+            && !event.repeat
+            && self.modifiers.control_key()
+            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyZ))
     }
 }
 
@@ -1085,9 +1331,22 @@ impl ApplicationHandler for App {
                     gpu.resize(&window);
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.update_cursor_position(position);
+                    if !consumed_by_egui {
+                        gpu.paint_at_cursor();
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } if button == MouseButton::Left => {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    if state == ElementState::Released || !consumed_by_egui {
+                        gpu.set_brush_down(state == ElementState::Pressed);
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } if !consumed_by_egui => {
@@ -1096,6 +1355,13 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if self.is_undo_shortcut(&event) {
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        gpu.undo_brush();
+                    }
+                    return;
+                }
+
                 if let Some(gpu) = self.gpu.as_mut()
                     && (!consumed_by_egui || event.state == ElementState::Released)
                 {

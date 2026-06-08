@@ -1,6 +1,8 @@
 use egui_wgpu::wgpu;
 use wgpu::util::DeviceExt;
 
+use crate::brush::{BrushEdit, BrushGpu, BrushStroke};
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ScreenSize {
@@ -74,6 +76,7 @@ pub struct Shaders {
     display_info_buffer: wgpu::Buffer,
     display_colors_buffer: wgpu::Buffer,
     render_groups: [wgpu::BindGroup; 2],
+    brush: BrushGpu,
 }
 
 impl Shaders {
@@ -99,6 +102,7 @@ impl Shaders {
             label: Some("rps render shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("render.wgsl").into()),
         });
+        let brush = BrushGpu::new(device);
 
         // -------------------------
         // Shared buffers
@@ -428,6 +432,7 @@ impl Shaders {
             display_info_buffer,
             display_colors_buffer,
             render_groups,
+            brush,
         }
     }
 
@@ -451,6 +456,40 @@ impl Shaders {
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(contents));
         }
         self.idx = 0;
+    }
+
+    pub fn apply_brush_edits(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: ScreenSize,
+        edits: &[BrushEdit],
+    ) -> Option<BrushStroke> {
+        self.brush.apply(
+            device,
+            queue,
+            [&self.rw_buffers[0], &self.rw_buffers[1]],
+            size,
+            self.idx,
+            edits,
+        )
+    }
+
+    pub fn undo_brush_stroke(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: ScreenSize,
+        stroke: BrushStroke,
+    ) {
+        self.brush.undo(
+            device,
+            queue,
+            [&self.rw_buffers[0], &self.rw_buffers[1]],
+            size,
+            self.idx,
+            stroke,
+        );
     }
 
     pub fn set_game_mode(&self, queue: &wgpu::Queue, mode: GameMode) {
