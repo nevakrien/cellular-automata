@@ -1,10 +1,10 @@
-struct GridSize {
+struct RpsParams {
     width: u32,
     height: u32,
 };
 
 @group(0) @binding(0)
-var<uniform> params: GridSize;
+var<uniform> params: RpsParams;
 
 @group(0) @binding(1)
 var<storage, read> input_grid: array<i32>;

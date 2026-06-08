@@ -3,9 +3,17 @@ use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GridSize {
+pub struct RpsParams {
     pub width: u32,
     pub height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DisplayInfo {
+    pub offset: [f32; 2],
+    pub scale: f32,
+    pub _pad: u32,
 }
 
 #[repr(C)]
@@ -14,22 +22,40 @@ pub struct DisplayColors {
     pub colors: [[f32; 4]; 4],
 }
 
+const DISPLAY_COLORS: [[f32; 4]; 4] = [
+    [0.0, 0.0, 0.0, 1.0], // 0 empty
+    [1.0, 0.1, 0.1, 1.0], // 1 rock
+    [0.1, 0.8, 0.1, 1.0], // 2 paper
+    [0.1, 0.2, 1.0, 1.0], // 3 scissors
+];
+
+impl DisplayInfo {
+    fn new(offset: [f32; 2], scale: f32) -> Self {
+        Self {
+            offset,
+            scale,
+            _pad: 0,
+        }
+    }
+}
+
 pub struct RpsShaders {
     compute_pipeline: wgpu::ComputePipeline,
-    size: wgpu::Buffer,
+    _size: wgpu::Buffer,
     rw_buffers: [wgpu::Buffer; 2],
     rw_groups: [wgpu::BindGroup; 2],
     idx: usize,
 
     render_pipeline: wgpu::RenderPipeline,
-    colors: wgpu::Buffer,
+    display_info_buffer: wgpu::Buffer,
+    _display_colors_buffer: wgpu::Buffer,
     render_groups: [wgpu::BindGroup; 2],
 }
 
 impl RpsShaders {
     pub fn new(
         device: &wgpu::Device,
-        size: GridSize,
+        size: RpsParams,
         contents: &[u32],
         surface_format: wgpu::TextureFormat,
     ) -> Self {
@@ -55,19 +81,22 @@ impl RpsShaders {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let colors_data = DisplayColors {
-            colors: [
-                [0.0, 0.0, 0.0, 1.0], // 0 empty
-                [1.0, 0.1, 0.1, 1.0], // 1 rock
-                [0.1, 0.8, 0.1, 1.0], // 2 paper
-                [0.1, 0.2, 1.0, 1.0], // 3 scissors
-            ],
+        let display_data = DisplayInfo::new([0.0, 0.0], 1.0);
+
+        let display_info_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rps display info uniform"),
+            contents: bytemuck::bytes_of(&display_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let display_colors = DisplayColors {
+            colors: DISPLAY_COLORS,
         };
 
-        let colors_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let display_colors_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("rps display colors uniform"),
-            contents: bytemuck::bytes_of(&colors_data),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            contents: bytemuck::bytes_of(&display_colors),
+            usage: wgpu::BufferUsages::UNIFORM,
         });
 
         let board_usage = wgpu::BufferUsages::STORAGE
@@ -90,7 +119,7 @@ impl RpsShaders {
         // -------------------------
         // Compute pipeline + groups
         // group(0):
-        //   binding 0 = GridSize uniform
+        //   binding 0 = RpsParams uniform
         //   binding 1 = input storage read
         //   binding 2 = output storage read_write
         // -------------------------
@@ -192,9 +221,10 @@ impl RpsShaders {
         // -------------------------
         // Render pipeline + groups
         // group(0):
-        //   binding 0 = GridSize uniform
-        //   binding 1 = DisplayColors uniform
-        //   binding 2 = input storage read
+        //   binding 0 = RpsParams uniform
+        //   binding 1 = DisplayInfo uniform
+        //   binding 2 = DisplayColors uniform
+        //   binding 3 = input storage read
         // -------------------------
 
         let render_bind_group_layout =
@@ -223,6 +253,16 @@ impl RpsShaders {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -287,10 +327,14 @@ impl RpsShaders {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: colors_buffer.as_entire_binding(),
+                        resource: display_info_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
+                        resource: display_colors_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
                         resource: rw_buffers[0].as_entire_binding(),
                     },
                 ],
@@ -306,10 +350,14 @@ impl RpsShaders {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: colors_buffer.as_entire_binding(),
+                        resource: display_info_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
+                        resource: display_colors_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
                         resource: rw_buffers[1].as_entire_binding(),
                     },
                 ],
@@ -318,13 +366,14 @@ impl RpsShaders {
 
         Self {
             compute_pipeline,
-            size: size_buffer,
+            _size: size_buffer,
             rw_buffers,
             rw_groups,
             idx: 0,
 
             render_pipeline,
-            colors: colors_buffer,
+            display_info_buffer,
+            _display_colors_buffer: display_colors_buffer,
             render_groups,
         }
     }
@@ -341,15 +390,25 @@ impl RpsShaders {
         self.idx = 1 - self.idx;
     }
 
+    pub fn reset(&mut self, queue: &wgpu::Queue, contents: &[u32]) {
+        for buffer in &self.rw_buffers {
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(contents));
+        }
+        self.idx = 0;
+    }
+
+    pub fn set_view(&self, queue: &wgpu::Queue, offset: [f32; 2], scale: f32) {
+        let display_data = DisplayInfo::new(offset, scale);
+        queue.write_buffer(
+            &self.display_info_buffer,
+            0,
+            bytemuck::bytes_of(&display_data),
+        );
+    }
+
     pub fn render<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         pass.set_pipeline(&self.render_pipeline);
         pass.set_bind_group(0, &self.render_groups[self.idx], &[]);
         pass.draw(0..3, 0..1);
-    }
-
-    fn current_buffer(&self) -> &wgpu::Buffer {
-        // After dispatch, idx was flipped.
-        // The current readable result is therefore the buffer that was just written.
-        &self.rw_buffers[self.idx]
     }
 }

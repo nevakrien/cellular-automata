@@ -1,26 +1,55 @@
+use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use egui_wgpu::wgpu;
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use egui_winit::winit::application::ApplicationHandler;
-use egui_winit::winit::event::{ElementState, KeyEvent, WindowEvent};
+use egui_winit::winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use egui_winit::winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use egui_winit::winit::keyboard::{Key, NamedKey};
+use egui_winit::winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use egui_winit::winit::window::{Window, WindowId};
 
 mod rps;
 
-use rps::{GridSize, RpsShaders};
+use rps::{RpsParams, RpsShaders};
 
-const GRID_SIZE: GridSize = GridSize {
-    width: 512,
-    height: 512,
+const GRID_SIZE: RpsParams = RpsParams {
+    width: 1024,
+    height: 1024,
 };
+
+const MIN_VIEW_SCALE: f32 = 1.0;
+const MAX_VIEW_SCALE: f32 = 128.0;
+const WHEEL_ZOOM_STEP: f32 = 1.15;
+const PAN_SCREENS_PER_SECOND: f32 = 0.75;
+
+#[derive(Default)]
+struct NavigationInput {
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+}
+
+impl NavigationInput {
+    fn any_pressed(&self) -> bool {
+        self.left || self.right || self.up || self.down
+    }
+}
 
 struct Simulation {
     shaders: RpsShaders,
-    size: GridSize,
+    size: RpsParams,
+    view_offset: [f32; 2],
+    view_scale: f32,
+    cursor_uv: Option<[f32; 2]>,
+    navigation: NavigationInput,
+    last_navigation_update: Instant,
+    seed: u64,
+    pending_seed: String,
+    cluster_size: u32,
     running: bool,
     step_once: bool,
     target_steps_per_second: f32,
@@ -34,14 +63,26 @@ struct Simulation {
 }
 
 impl Simulation {
-    fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
-        let contents = initial_board(GRID_SIZE);
+    fn new(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        config: StartupConfig,
+    ) -> Self {
+        let contents = initial_board(GRID_SIZE, config.seed, config.cluster_size);
         let shaders = RpsShaders::new(device, GRID_SIZE, &contents, surface_format);
         let now = Instant::now();
 
         Self {
             shaders,
             size: GRID_SIZE,
+            view_offset: [0.0, 0.0],
+            view_scale: 1.0,
+            cursor_uv: None,
+            navigation: NavigationInput::default(),
+            last_navigation_update: now,
+            seed: config.seed,
+            pending_seed: config.seed.to_string(),
+            cluster_size: config.cluster_size,
             running: true,
             step_once: false,
             target_steps_per_second: 30.0,
@@ -55,10 +96,137 @@ impl Simulation {
         }
     }
 
+    fn reset(&mut self, queue: &wgpu::Queue) {
+        let seed = self.pending_seed.trim().parse().unwrap_or(self.seed);
+        let cluster_size = self.cluster_size.max(1);
+        let contents = initial_board(self.size, seed, cluster_size);
+        self.shaders.reset(queue, &contents);
+
+        let now = Instant::now();
+        self.seed = seed;
+        self.pending_seed = seed.to_string();
+        self.cluster_size = cluster_size;
+        self.step_once = false;
+        self.measured_steps_per_second = 0.0;
+        self.steps_in_sample = 0;
+        self.generation = 0;
+        self.next_step_at = now;
+        self.step_sample_started_at = now;
+        println!(
+            "map seed: {} (cluster size: {})",
+            self.seed, self.cluster_size
+        );
+    }
+
     fn begin_frame(&mut self) {
         let now = Instant::now();
         self.frame_time_ms = (now - self.last_frame).as_secs_f32() * 1_000.0;
         self.last_frame = now;
+    }
+
+    fn update_cursor_for_window(
+        &mut self,
+        position: egui_winit::winit::dpi::PhysicalPosition<f64>,
+        width: u32,
+        height: u32,
+    ) {
+        self.cursor_uv = Some([
+            (position.x as f32 / width.max(1) as f32).clamp(0.0, 1.0),
+            1.0 - (position.y as f32 / height.max(1) as f32).clamp(0.0, 1.0),
+        ]);
+    }
+
+    fn handle_navigation_key(&mut self, key: &KeyEvent) -> bool {
+        let pressed = key.state == ElementState::Pressed;
+        match key.physical_key {
+            PhysicalKey::Code(KeyCode::KeyA) | PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                self.navigation.left = pressed;
+                true
+            }
+            PhysicalKey::Code(KeyCode::KeyD) | PhysicalKey::Code(KeyCode::ArrowRight) => {
+                self.navigation.right = pressed;
+                true
+            }
+            PhysicalKey::Code(KeyCode::KeyW) | PhysicalKey::Code(KeyCode::ArrowUp) => {
+                self.navigation.up = pressed;
+                true
+            }
+            PhysicalKey::Code(KeyCode::KeyS) | PhysicalKey::Code(KeyCode::ArrowDown) => {
+                self.navigation.down = pressed;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_mouse_wheel(&mut self, queue: &wgpu::Queue, delta: MouseScrollDelta) {
+        let wheel_delta = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y,
+            MouseScrollDelta::PixelDelta(position) => position.y as f32 / 120.0,
+        };
+        if wheel_delta == 0.0 {
+            return;
+        }
+
+        let cursor_uv = self.cursor_uv.unwrap_or([0.5, 0.5]);
+        let old_scale = self.view_scale;
+        let new_scale =
+            (old_scale * WHEEL_ZOOM_STEP.powf(wheel_delta)).clamp(MIN_VIEW_SCALE, MAX_VIEW_SCALE);
+        let world_under_cursor = [
+            self.view_offset[0] + cursor_uv[0] / old_scale,
+            self.view_offset[1] + cursor_uv[1] / old_scale,
+        ];
+
+        self.view_scale = new_scale;
+        self.view_offset = [
+            world_under_cursor[0] - cursor_uv[0] / new_scale,
+            world_under_cursor[1] - cursor_uv[1] / new_scale,
+        ];
+        self.clamp_view();
+        self.write_view(queue);
+    }
+
+    fn update_keyboard_navigation(&mut self, queue: &wgpu::Queue, now: Instant) -> bool {
+        let dt = (now - self.last_navigation_update).as_secs_f32().min(0.1);
+        self.last_navigation_update = now;
+
+        if !self.navigation.any_pressed() || dt == 0.0 {
+            return false;
+        }
+
+        let step = PAN_SCREENS_PER_SECOND * dt / self.view_scale;
+        let old_offset = self.view_offset;
+        if self.navigation.left {
+            self.view_offset[0] -= step;
+        }
+        if self.navigation.right {
+            self.view_offset[0] += step;
+        }
+        if self.navigation.down {
+            self.view_offset[1] -= step;
+        }
+        if self.navigation.up {
+            self.view_offset[1] += step;
+        }
+
+        self.clamp_view();
+        if self.view_offset == old_offset {
+            return false;
+        }
+
+        self.write_view(queue);
+        true
+    }
+
+    fn clamp_view(&mut self) {
+        let max_offset = 1.0 - 1.0 / self.view_scale;
+        self.view_offset[0] = self.view_offset[0].clamp(0.0, max_offset);
+        self.view_offset[1] = self.view_offset[1].clamp(0.0, max_offset);
+    }
+
+    fn write_view(&self, queue: &wgpu::Queue) {
+        self.shaders
+            .set_view(queue, self.view_offset, self.view_scale);
     }
 
     fn step_interval(&self) -> Duration {
@@ -93,14 +261,89 @@ impl Simulation {
     }
 }
 
-fn initial_board(size: GridSize) -> Vec<u32> {
+#[derive(Clone, Copy)]
+struct StartupConfig {
+    seed: u64,
+    cluster_size: u32,
+}
+
+impl StartupConfig {
+    fn from_args() -> Result<Self, String> {
+        let mut seed = None;
+        let mut cluster_size = 24;
+        let mut args = env::args().skip(1);
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--seed" | "-s" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| format!("missing value after {arg}"))?;
+                    seed = Some(parse_u64_arg("seed", &value)?);
+                }
+                "--cluster-size" | "-c" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| format!("missing value after {arg}"))?;
+                    cluster_size = parse_u32_arg("cluster-size", &value)?.max(1);
+                }
+                "--help" | "-h" => {
+                    return Err(
+                        "usage: cellular-automata [--seed <u64>] [--cluster-size <u32>]"
+                            .to_string(),
+                    );
+                }
+                _ => return Err(format!("unknown argument: {arg}")),
+            }
+        }
+
+        Ok(Self {
+            seed: seed.unwrap_or_else(random_seed),
+            cluster_size,
+        })
+    }
+}
+
+fn parse_u64_arg(name: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{name} must be an unsigned integer, got {value:?}"))
+}
+
+fn parse_u32_arg(name: &str, value: &str) -> Result<u32, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{name} must be an unsigned integer, got {value:?}"))
+}
+
+fn random_seed() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    mix64(nanos ^ std::process::id() as u64)
+}
+
+fn mix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn initial_board(size: RpsParams, seed: u64, cluster_size: u32) -> Vec<u32> {
     let mut board = Vec::with_capacity(size.width as usize * size.height as usize);
+    let cluster_size = cluster_size.max(1);
 
     for y in 0..size.height {
         for x in 0..size.width {
-            let quadrant = (x >= size.width / 2) as u32 + 2 * (y >= size.height / 2) as u32;
-            let noise = ((x.wrapping_mul(73_856_093)) ^ (y.wrapping_mul(19_349_663))) % 17;
-            let cell = match (quadrant + noise) % 3 {
+            let cluster_x = x / cluster_size;
+            let cluster_y = y / cluster_size;
+            let noise = mix64(
+                seed ^ (cluster_x as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
+                    ^ (cluster_y as u64).wrapping_mul(0xABC9_83AD_8EBC_8A63),
+            );
+            let cell = match noise % 3 {
                 0 => 1,
                 1 => 2,
                 _ => 3,
@@ -125,7 +368,7 @@ struct GpuState {
 }
 
 impl GpuState {
-    async fn new(window: Arc<Window>) -> Result<Self, anyhow::Error> {
+    async fn new(window: Arc<Window>, config: StartupConfig) -> Result<Self, anyhow::Error> {
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window.clone()).unwrap();
         let adapter = instance
@@ -170,7 +413,7 @@ impl GpuState {
 
         let (egui_context, egui_state, egui_renderer) =
             Self::create_egui(&window, &device, surface_config.format);
-        let simulation = Simulation::new(&device, surface_config.format);
+        let simulation = Simulation::new(&device, surface_config.format, config);
 
         Ok(Self {
             surface,
@@ -223,14 +466,18 @@ impl GpuState {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    fn run_hud(&mut self, window: &Window) -> egui::FullOutput {
+    fn run_hud(&mut self, window: &Window) -> (egui::FullOutput, bool) {
         let raw_input = self.egui_state.take_egui_input(window);
-        self.egui_context.run(raw_input, |ctx| {
-            Self::draw_hud(ctx, &mut self.simulation);
-        })
+        let mut reset_requested = false;
+        let output = self.egui_context.run(raw_input, |ctx| {
+            reset_requested = Self::draw_hud(ctx, &mut self.simulation);
+        });
+        (output, reset_requested)
     }
 
-    fn draw_hud(ctx: &egui::Context, simulation: &mut Simulation) {
+    fn draw_hud(ctx: &egui::Context, simulation: &mut Simulation) -> bool {
+        let mut reset_requested = false;
+
         egui::Window::new("Rock Paper Scissors")
             .default_pos([12.0, 12.0])
             .show(ctx, |ui| {
@@ -256,10 +503,42 @@ impl GpuState {
                 );
 
                 ui.separator();
+                ui.label(format!("Seed: {}", simulation.seed));
+                ui.horizontal(|ui| {
+                    ui.label("Set seed");
+                    ui.text_edit_singleline(&mut simulation.pending_seed);
+                });
+                let seed_is_valid = simulation.pending_seed.trim().parse::<u64>().is_ok();
+                ui.add(
+                    egui::Slider::new(&mut simulation.cluster_size, 1..=128)
+                        .text("startup cluster size"),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(seed_is_valid, egui::Button::new("Reset map"))
+                        .clicked()
+                    {
+                        reset_requested = true;
+                    }
+                    if ui.button("Random seed").clicked() {
+                        simulation.pending_seed = random_seed().to_string();
+                        reset_requested = true;
+                    }
+                });
+                if !seed_is_valid {
+                    ui.label("Seed must be a whole number");
+                }
+
+                ui.separator();
                 ui.label(format!(
                     "Grid: {} x {} cells",
                     simulation.size.width, simulation.size.height
                 ));
+                ui.label(format!(
+                    "View: {:.1}x zoom, offset {:.3}, {:.3}",
+                    simulation.view_scale, simulation.view_offset[0], simulation.view_offset[1]
+                ));
+                ui.label("Mouse wheel zooms; WASD or arrows move the view");
                 ui.label(format!("Generation: {}", simulation.generation));
                 ui.label(format!(
                     "Steps: {:.1} / second",
@@ -268,6 +547,32 @@ impl GpuState {
                 ui.label(format!("Frame: {:.2} ms", simulation.frame_time_ms));
                 ui.label("Red = rock, green = paper, blue = scissors");
             });
+
+        reset_requested
+    }
+
+    fn reset_simulation(&mut self) {
+        self.simulation.reset(&self.queue);
+    }
+
+    fn update_cursor_position(&mut self, position: egui_winit::winit::dpi::PhysicalPosition<f64>) {
+        self.simulation.update_cursor_for_window(
+            position,
+            self.surface_config.width,
+            self.surface_config.height,
+        );
+    }
+
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        self.simulation.handle_mouse_wheel(&self.queue, delta);
+    }
+
+    fn handle_navigation_key(&mut self, key: &KeyEvent) -> bool {
+        self.simulation.handle_navigation_key(key)
+    }
+
+    fn update_keyboard_navigation(&mut self, now: Instant) -> bool {
+        self.simulation.update_keyboard_navigation(&self.queue, now)
     }
 
     fn run_simulation_step(&mut self) {
@@ -352,9 +657,13 @@ impl GpuState {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         self.simulation.begin_frame();
-        let full_output = self.run_hud(window);
+        let (full_output, reset_requested) = self.run_hud(window);
         self.egui_state
             .handle_platform_output(window, full_output.platform_output);
+
+        if reset_requested {
+            self.reset_simulation();
+        }
 
         for (texture_id, image_delta) in &full_output.textures_delta.set {
             self.egui_renderer
@@ -395,10 +704,20 @@ impl GpuState {
     }
 }
 
-#[derive(Default)]
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
+    config: StartupConfig,
+}
+
+impl App {
+    fn new(config: StartupConfig) -> Self {
+        Self {
+            window: None,
+            gpu: None,
+            config,
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -412,7 +731,7 @@ impl ApplicationHandler for App {
                 .create_window(Window::default_attributes().with_title("cellular automata"))
                 .unwrap(),
         );
-        self.gpu = Some(pollster::block_on(GpuState::new(window.clone())).unwrap());
+        self.gpu = Some(pollster::block_on(GpuState::new(window.clone(), self.config)).unwrap());
         self.window = Some(window);
     }
 
@@ -450,6 +769,26 @@ impl ApplicationHandler for App {
                     gpu.resize(window);
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.update_cursor_position(position);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if !consumed_by_egui => {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.handle_mouse_wheel(delta);
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let Some(gpu) = self.gpu.as_mut()
+                    && (!consumed_by_egui || event.state == ElementState::Released)
+                {
+                    if gpu.handle_navigation_key(&event) {
+                        window.request_redraw();
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.render(window);
@@ -467,12 +806,19 @@ impl ApplicationHandler for App {
         };
 
         let now = Instant::now();
+        let view_moved = gpu.update_keyboard_navigation(now);
+        if view_moved {
+            window.request_redraw();
+        }
+
         if gpu.simulation.wants_step(now) {
             gpu.run_simulation_step();
             window.request_redraw();
         }
 
-        if gpu.simulation.running {
+        if gpu.simulation.navigation.any_pressed() {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else if gpu.simulation.running {
             event_loop.set_control_flow(ControlFlow::WaitUntil(gpu.simulation.next_step_at));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
@@ -481,10 +827,19 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = StartupConfig::from_args().map_err(|error| {
+        eprintln!("{error}");
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+    })?;
+    println!(
+        "map seed: {} (cluster size: {})",
+        config.seed, config.cluster_size
+    );
+
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = App::default();
+    let mut app = App::new(config);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
