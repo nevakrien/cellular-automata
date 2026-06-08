@@ -25,6 +25,10 @@ const MAX_VIEW_SCALE: f32 = 128.0;
 const WHEEL_ZOOM_STEP: f32 = 1.15;
 const PAN_SCREENS_PER_SECOND: f32 = 0.75;
 
+const REASONABLE_MAX_TARGET_STEPS_PER_SECOND: f32 = 240.0;
+const REASONABLE_MAX_SIMULATION_STEPS_PER_TICK: usize = 16;
+const REASONABLE_MAX_STARTUP_CLUSTER_SIZE: u32 = 128;
+
 #[derive(Default)]
 struct NavigationInput {
     left: bool,
@@ -279,7 +283,13 @@ impl Simulation {
     }
 
     fn step_interval(&self) -> Duration {
-        Duration::from_secs_f32(1.0 / self.target_steps_per_second.max(1.0))
+        let seconds = 1.0 / self.target_steps_per_second.max(1.0);
+
+        if seconds.is_finite() && seconds >= 1e-9 {
+            Duration::from_secs_f32(seconds)
+        } else {
+            Duration::from_nanos(1)
+        }
     }
 
     fn wants_step(&self, now: Instant) -> bool {
@@ -663,13 +673,21 @@ impl GpuState {
                 });
 
                 ui.add(
-                    egui::Slider::new(&mut simulation.target_steps_per_second, 1.0..=240.0)
-                        .text("target steps / second"),
+                    egui::Slider::new(
+                        &mut simulation.target_steps_per_second,
+                        1.0..=REASONABLE_MAX_TARGET_STEPS_PER_SECOND,
+                    )
+                        .text("target steps / second")
+                        .clamping(egui::SliderClamping::Never),
                 );
 
                 ui.add(
-                    egui::Slider::new(&mut simulation.max_simulation_steps_per_tick, 1..=256)
-                        .text("max steps / tick"),
+                    egui::Slider::new(
+                        &mut simulation.max_simulation_steps_per_tick,
+                        1..=REASONABLE_MAX_SIMULATION_STEPS_PER_TICK,
+                    )
+                        .text("max steps / tick")
+                        .clamping(egui::SliderClamping::Never),
                 );
 
                 ui.separator();
@@ -680,8 +698,12 @@ impl GpuState {
                 });
                 let seed_is_valid = simulation.pending_seed.trim().parse::<u64>().is_ok();
                 ui.add(
-                    egui::Slider::new(&mut simulation.cluster_size, 1..=128)
-                        .text("startup cluster size"),
+                    egui::Slider::new(
+                        &mut simulation.cluster_size,
+                        1..=REASONABLE_MAX_STARTUP_CLUSTER_SIZE,
+                    )
+                        .text("startup cluster size")
+                        .clamping(egui::SliderClamping::Never),
                 );
                 ui.horizontal(|ui| {
                     if ui
