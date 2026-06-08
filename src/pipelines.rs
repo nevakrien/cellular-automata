@@ -21,12 +21,14 @@ pub struct DisplayInfo {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DisplayColors {
-    pub colors: [[f32; 4]; 4],
+    pub colors: [[f32; 4]; 8],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GameMode {
     Rps,
+    SuperRps,
+    TwoParadox,
     Life,
 }
 
@@ -34,23 +36,44 @@ impl GameMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Rps => "Rock Paper Scissors",
+            Self::SuperRps => "Super RPS",
+            Self::TwoParadox => "Two Paradox",
             Self::Life => "Game of Life",
         }
     }
 }
 
-const RPS_DISPLAY_COLORS: [[f32; 4]; 4] = [
+const RPS_DISPLAY_COLORS: [[f32; 4]; 8] = [
     [0.0, 0.0, 0.0, 1.0], // 0 empty
     [1.0, 0.1, 0.1, 1.0], // 1 rock
     [0.1, 0.8, 0.1, 1.0], // 2 paper
     [0.1, 0.2, 1.0, 1.0], // 3 scissors
+    [1.0, 0.0, 1.0, 1.0], // invalid for RPS
+    [1.0, 0.0, 1.0, 1.0], // invalid for RPS
+    [1.0, 0.0, 1.0, 1.0], // invalid for RPS
+    [1.0, 0.0, 1.0, 1.0], // invalid for RPS
 ];
 
-const LIFE_DISPLAY_COLORS: [[f32; 4]; 4] = [
+const SEVEN_STATE_DISPLAY_COLORS: [[f32; 4]; 8] = [
+    [0.0, 0.0, 0.0, 1.0],  // 0 empty
+    [1.0, 0.1, 0.1, 1.0],  // 1 red
+    [1.0, 0.9, 0.0, 1.0],  // 2 yellow
+    [1.0, 0.55, 0.0, 1.0], // 3 orange
+    [0.1, 0.2, 1.0, 1.0],  // 4 blue
+    [0.0, 0.9, 0.95, 1.0], // 5 cyan
+    [0.1, 0.8, 0.1, 1.0],  // 6 green
+    [0.55, 0.1, 1.0, 1.0], // 7 violet
+];
+
+const LIFE_DISPLAY_COLORS: [[f32; 4]; 8] = [
     [1.0, 0.0, 1.0, 1.0], // 0 invalid for Life
     [1.0, 1.0, 1.0, 1.0], // 1 live
     [0.0, 0.0, 0.0, 1.0], // 2 dead
     [1.0, 0.0, 1.0, 1.0], // 3 invalid for Life
+    [1.0, 0.0, 1.0, 1.0], // 4 invalid for Life
+    [1.0, 0.0, 1.0, 1.0], // 5 invalid for Life
+    [1.0, 0.0, 1.0, 1.0], // 6 invalid for Life
+    [1.0, 0.0, 1.0, 1.0], // 7 invalid for Life
 ];
 
 impl DisplayInfo {
@@ -65,6 +88,8 @@ impl DisplayInfo {
 
 pub struct Shaders {
     rps_compute_pipeline: wgpu::ComputePipeline,
+    super_rps_compute_pipeline: wgpu::ComputePipeline,
+    two_paradox_compute_pipeline: wgpu::ComputePipeline,
     life_compute_pipeline: wgpu::ComputePipeline,
 
     _size: wgpu::Buffer,
@@ -91,6 +116,16 @@ impl Shaders {
         let rps_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rps compute shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("rps.wgsl").into()),
+        });
+
+        let super_rps_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("super rps compute shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("super_rps.wgsl").into()),
+        });
+
+        let two_paradox_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("two paradox compute shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("two_paradox.wgsl").into()),
         });
 
         let life_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -216,6 +251,26 @@ impl Shaders {
                 label: Some("life compute pipeline"),
                 layout: Some(&compute_pipeline_layout),
                 module: &life_compute_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+        let super_rps_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("super rps compute pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &super_rps_compute_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+        let two_paradox_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("two paradox compute pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &two_paradox_compute_shader,
                 entry_point: Some("cs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
@@ -421,6 +476,8 @@ impl Shaders {
 
         Self {
             rps_compute_pipeline,
+            super_rps_compute_pipeline,
+            two_paradox_compute_pipeline,
             life_compute_pipeline,
 
             _size: size_buffer,
@@ -442,6 +499,8 @@ impl Shaders {
 
         match mode {
             GameMode::Rps => pass.set_pipeline(&self.rps_compute_pipeline),
+            GameMode::SuperRps => pass.set_pipeline(&self.super_rps_compute_pipeline),
+            GameMode::TwoParadox => pass.set_pipeline(&self.two_paradox_compute_pipeline),
             GameMode::Life => pass.set_pipeline(&self.life_compute_pipeline),
         }
         pass.set_bind_group(0, &self.rw_groups[self.idx], &[]);
@@ -495,6 +554,7 @@ impl Shaders {
     pub fn set_game_mode(&self, queue: &wgpu::Queue, mode: GameMode) {
         let colors = match mode {
             GameMode::Rps => RPS_DISPLAY_COLORS,
+            GameMode::SuperRps | GameMode::TwoParadox => SEVEN_STATE_DISPLAY_COLORS,
             GameMode::Life => LIFE_DISPLAY_COLORS,
         };
         let display_colors = DisplayColors { colors };

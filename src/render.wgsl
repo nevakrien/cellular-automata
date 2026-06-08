@@ -11,7 +11,7 @@ struct DisplayInfo {
 };
 
 struct DisplayColors {
-    colors: array<vec4<f32>,4>,
+    colors: array<vec4<f32>,8>,
 };
 
 
@@ -73,7 +73,7 @@ fn fs_main(in: FragmentInput) -> @location(0) vec4<f32> {
 
     let cell = input_grid[index];
 
-    if (cell < 0 || cell > 3) {
+    if (cell < 0 || cell > 7) {
         return vec4<f32>(1.0, 0.0, 1.0, 1.0); // debug magenta for bad state
     }
 

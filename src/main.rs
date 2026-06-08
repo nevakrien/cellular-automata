@@ -184,8 +184,14 @@ impl Simulation {
         let seed = self.pending_seed.trim().parse().unwrap_or(self.seed);
         let cluster_size = self.cluster_size.max(1);
         let size = ScreenSize {
-            width: self.pending_size.width.clamp(MIN_GRID_DIMENSION, MAX_GRID_DIMENSION),
-            height: self.pending_size.height.clamp(MIN_GRID_DIMENSION, MAX_GRID_DIMENSION),
+            width: self
+                .pending_size
+                .width
+                .clamp(MIN_GRID_DIMENSION, MAX_GRID_DIMENSION),
+            height: self
+                .pending_size
+                .height
+                .clamp(MIN_GRID_DIMENSION, MAX_GRID_DIMENSION),
         };
         let contents = initial_board(size, seed, cluster_size, self.game_mode);
 
@@ -603,6 +609,7 @@ fn initial_board(size: ScreenSize, seed: u64, cluster_size: u32, game_mode: Game
                     1 => 2,
                     _ => 3,
                 },
+                GameMode::SuperRps | GameMode::TwoParadox => (noise % 7 + 1) as u32,
                 GameMode::Life => {
                     if noise % 4 == 0 {
                         1
@@ -871,6 +878,16 @@ impl GpuState {
                                     );
                                     ui.selectable_value(
                                         &mut simulation.game_mode,
+                                        GameMode::SuperRps,
+                                        GameMode::SuperRps.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut simulation.game_mode,
+                                        GameMode::TwoParadox,
+                                        GameMode::TwoParadox.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut simulation.game_mode,
                                         GameMode::Life,
                                         GameMode::Life.label(),
                                     );
@@ -926,8 +943,7 @@ impl GpuState {
                             ui.label("Set seed");
                             ui.text_edit_singleline(&mut simulation.pending_seed);
                         });
-                        let seed_is_valid =
-                            simulation.pending_seed.trim().parse::<u64>().is_ok();
+                        let seed_is_valid = simulation.pending_seed.trim().parse::<u64>().is_ok();
                         ui.add(
                             egui::Slider::new(
                                 &mut simulation.cluster_size,
@@ -1009,6 +1025,36 @@ impl GpuState {
                                             );
                                         });
                                 }
+                                GameMode::SuperRps | GameMode::TwoParadox => {
+                                    egui::ComboBox::from_id_salt("brush_value")
+                                        .selected_text(match simulation.brush_value {
+                                            0 => "Empty",
+                                            1 => "1",
+                                            2 => "2",
+                                            3 => "3",
+                                            4 => "4",
+                                            5 => "5",
+                                            6 => "6",
+                                            7 => "7",
+                                            _ => "Invalid",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for value in 0..=7 {
+                                                ui.selectable_value(
+                                                    &mut simulation.brush_value,
+                                                    value,
+                                                    if value == 0 {
+                                                        "Empty".to_owned()
+                                                    } else {
+                                                        value.to_string()
+                                                    },
+                                                );
+                                            }
+                                        });
+                                    if simulation.brush_value > 7 {
+                                        simulation.brush_value = 1;
+                                    }
+                                }
                                 GameMode::Life => {
                                     egui::ComboBox::from_id_salt("brush_value")
                                         .selected_text(if simulation.brush_value == 1 {
@@ -1028,9 +1074,7 @@ impl GpuState {
                                                 "Dead",
                                             );
                                         });
-                                    if simulation.brush_value != 1
-                                        && simulation.brush_value != 2
-                                    {
+                                    if simulation.brush_value != 1 && simulation.brush_value != 2 {
                                         simulation.brush_value = 1;
                                     }
                                 }
@@ -1057,21 +1101,20 @@ impl GpuState {
                     .show(ui, |ui| {
                         ui.separator();
                         match simulation.game_mode {
-                            GameMode::Rps => {
-                                ui.label("Red = rock, green = paper, blue = scissors")
-                            }
-                            GameMode::Life => {
-                                ui.label("White = live, black = dead")
-                            }
+                            GameMode::Rps => ui.label("Red = rock, green = paper, blue = scissors"),
+                            GameMode::SuperRps => ui.label(
+                                "Normal 7-state RPS. Black = empty; red beats green, green beats blue",
+                            ),
+                            GameMode::TwoParadox => ui.label(
+                                "Two-paradox graph. Black = empty; red beats green, green beats blue",
+                            ),
+                            GameMode::Life => ui.label("White = live, black = dead"),
                         };
                         ui.label(format!(
                             "Steps: {:.1} / second",
                             simulation.measured_steps_per_second
                         ));
-                        ui.label(format!(
-                            "Frame: {:.2} ms",
-                            frame_stats.frame_time_ms
-                        ));
+                        ui.label(format!("Frame: {:.2} ms", frame_stats.frame_time_ms));
                         ui.label(format!(
                             "FPS: {:.1} presented / second",
                             frame_stats.measured_frames_per_second
@@ -1178,12 +1221,11 @@ impl GpuState {
             .brush_edits_between(self.simulation.last_brush_cell, cell);
         let size = self.simulation.size;
         self.simulation.last_brush_cell = Some(cell);
-        if let Some(stroke) = self.simulation.shaders_mut().apply_brush_edits(
-            &self.device,
-            &self.queue,
-            size,
-            &edits,
-        ) {
+        if let Some(stroke) =
+            self.simulation
+                .shaders_mut()
+                .apply_brush_edits(&self.device, &self.queue, size, &edits)
+        {
             self.simulation.in_progress_brush_strokes.push(stroke);
         }
     }
