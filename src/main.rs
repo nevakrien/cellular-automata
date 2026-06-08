@@ -24,7 +24,6 @@ const MIN_VIEW_SCALE: f32 = 1.0;
 const MAX_VIEW_SCALE: f32 = 128.0;
 const WHEEL_ZOOM_STEP: f32 = 1.15;
 const PAN_SCREENS_PER_SECOND: f32 = 0.75;
-const MAX_SIMULATION_STEPS_PER_TICK: usize = 8;
 
 #[derive(Default)]
 struct NavigationInput {
@@ -54,10 +53,13 @@ struct Simulation {
     running: bool,
     step_once: bool,
     target_steps_per_second: f32,
+    max_simulation_steps_per_tick: usize,
     measured_steps_per_second: f32,
     steps_in_sample: u32,
     generation: u64,
     frame_time_ms: f32,
+    show_fps_counter: bool,
+    show_steps_counter: bool,
     last_frame: Instant,
     next_step_at: Instant,
     step_sample_started_at: Instant,
@@ -87,10 +89,13 @@ impl Simulation {
             running: true,
             step_once: false,
             target_steps_per_second: 30.0,
+            max_simulation_steps_per_tick: 8,
             measured_steps_per_second: 0.0,
             steps_in_sample: 0,
             generation: 0,
             frame_time_ms: 0.0,
+            show_fps_counter: false,
+            show_steps_counter: false,
             last_frame: now,
             next_step_at: now,
             step_sample_started_at: now,
@@ -269,12 +274,16 @@ impl Simulation {
         }
 
         if self.running {
-            let interval = self.step_interval();
-            while self.next_step_at <= now {
-                self.next_step_at += interval;
-            }
+            self.next_step_at += self.step_interval();
         } else {
             self.next_step_at = now;
+        }
+    }
+
+    fn discard_step_debt(&mut self, now: Instant) {
+        let interval = self.step_interval();
+        while self.next_step_at <= now {
+            self.next_step_at += interval;
         }
     }
 }
@@ -521,6 +530,11 @@ impl GpuState {
                         .text("target steps / second"),
                 );
 
+                ui.add(
+                    egui::Slider::new(&mut simulation.max_simulation_steps_per_tick, 1..=256)
+                        .text("max steps / tick"),
+                );
+
                 ui.separator();
                 ui.label(format!("Seed: {}", simulation.seed));
                 ui.horizontal(|ui| {
@@ -564,8 +578,45 @@ impl GpuState {
                     simulation.measured_steps_per_second
                 ));
                 ui.label(format!("Frame: {:.2} ms", simulation.frame_time_ms));
+                ui.checkbox(&mut simulation.show_fps_counter, "Show FPS counter");
+                ui.checkbox(&mut simulation.show_steps_counter, "Show steps counter");
                 ui.label("Red = rock, green = paper, blue = scissors");
             });
+
+        if simulation.show_fps_counter {
+            let fps = if simulation.frame_time_ms > 0.0 {
+                1_000.0 / simulation.frame_time_ms
+            } else {
+                0.0
+            };
+
+            egui::Area::new("fps_counter".into())
+                .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::window(ui.style())
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.label(format!("FPS: {:.1}", fps));
+                        });
+                });
+        }
+
+        if simulation.show_steps_counter {
+            egui::Area::new("steps_counter".into())
+                .anchor(egui::Align2::RIGHT_TOP, [-12.0, 56.0])
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::window(ui.style())
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.label(format!(
+                                "Steps: {:.1}/s",
+                                simulation.measured_steps_per_second
+                            ));
+                        });
+                });
+        }
 
         reset_requested
     }
@@ -596,17 +647,22 @@ impl GpuState {
 
     fn run_due_simulation_steps(&mut self, now: Instant) -> bool {
         let mut stepped = false;
-        for _ in 0..MAX_SIMULATION_STEPS_PER_TICK {
+        let max_steps = self.simulation.max_simulation_steps_per_tick;
+        let mut steps = 0;
+
+        for _ in 0..max_steps {
             if !self.simulation.wants_step(now) {
                 break;
             }
 
             self.run_simulation_step(now);
             stepped = true;
+            steps += 1;
         }
 
-        if stepped && self.simulation.wants_step(now) {
-            self.simulation.next_step_at = Instant::now();
+        let finished_at = Instant::now();
+        if steps == max_steps && self.simulation.wants_step(finished_at) {
+            self.simulation.discard_step_debt(finished_at);
         }
 
         stepped
