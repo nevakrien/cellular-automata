@@ -791,209 +791,255 @@ impl GpuState {
     ) -> HudAction {
         let mut action = HudAction::default();
 
-        egui::Window::new("")
+        egui::Window::new("GPU Cellular Automaton")
             .default_open(false)
             .default_pos([12.0, 12.0])
             .show(ctx, |ui| {
-                ui.label("GPU cellular automaton");
-                ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Mode");
-                    let old_mode = simulation.game_mode;
-                    egui::ComboBox::from_id_salt("game_mode")
-                        .selected_text(simulation.game_mode.label())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut simulation.game_mode,
-                                GameMode::Rps,
-                                GameMode::Rps.label(),
-                            );
-                            ui.selectable_value(
-                                &mut simulation.game_mode,
-                                GameMode::Life,
-                                GameMode::Life.label(),
-                            );
-                        });
-                    if simulation.game_mode != old_mode {
-                        action.reset_requested = true;
-                    }
+                    ui.checkbox(&mut frame_stats.show_fps_counter, "FPS");
+                    ui.checkbox(&mut simulation.show_steps_counter, "Steps");
                 });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let label = if simulation.running { "Pause" } else { "Run" };
-                    if ui.button(label).clicked() {
-                        if !simulation.running {
-                            simulation.clear_undo();
-                            simulation.cancel_brush_unit();
-                        }
-                        simulation.running = !simulation.running;
-                    }
-
-                    if ui
-                        .add_enabled(!simulation.running, egui::Button::new("Step"))
-                        .clicked()
-                    {
-                        simulation.step_once = true;
-                    }
-                });
-
-                ui.add(
-                    egui::Slider::new(
-                        &mut simulation.target_steps_per_second,
-                        1.0..=REASONABLE_MAX_TARGET_STEPS_PER_SECOND,
-                    )
-                    .text("target steps / second")
-                    .clamping(egui::SliderClamping::Never),
-                );
-
-                ui.add(
-                    egui::Slider::new(
-                        &mut simulation.max_simulation_steps_per_tick,
-                        1..=REASONABLE_MAX_SIMULATION_STEPS_PER_TICK,
-                    )
-                    .text("max steps / tick")
-                    .clamping(egui::SliderClamping::Never),
-                );
-
-                ui.separator();
-                ui.label(format!("Seed: {}", simulation.seed));
-                ui.horizontal(|ui| {
-                    ui.label("Set seed");
-                    ui.text_edit_singleline(&mut simulation.pending_seed);
-                });
-                let seed_is_valid = simulation.pending_seed.trim().parse::<u64>().is_ok();
-                ui.add(
-                    egui::Slider::new(
-                        &mut simulation.cluster_size,
-                        1..=REASONABLE_MAX_STARTUP_CLUSTER_SIZE,
-                    )
-                    .text("startup cluster size")
-                    .clamping(egui::SliderClamping::Never),
-                );
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(seed_is_valid, egui::Button::new("Reset map"))
-                        .clicked()
-                    {
-                        action.reset_requested = true;
-                    }
-                    if ui.button("Random seed").clicked() {
-                        simulation.pending_seed = random_seed().to_string();
-                        action.reset_requested = true;
-                    }
-                });
-                if !seed_is_valid {
-                    ui.label("Seed must be a whole number");
-                }
-
-                ui.separator();
-                ui.label(format!(
-                    "Grid: {} x {} cells",
-                    simulation.size.width, simulation.size.height
-                ));
-                ui.label(format!(
-                    "View: {:.1}x zoom, offset {:.3}, {:.3}",
-                    simulation.view_scale, simulation.view_offset[0], simulation.view_offset[1]
-                ));
-                ui.label("Mouse wheel zooms; WASD or arrows move the view");
-                ui.separator();
-                ui.label("Brush");
-                ui.add_enabled_ui(!simulation.running, |ui| {
-                    ui.add(egui::Slider::new(&mut simulation.brush_radius, 0..=128).text("radius"));
-                    match simulation.game_mode {
-                        GameMode::Rps => {
-                            egui::ComboBox::from_id_salt("brush_value")
-                                .selected_text(match simulation.brush_value {
-                                    0 => "Empty",
-                                    1 => "Rock",
-                                    2 => "Paper",
-                                    3 => "Scissors",
-                                    _ => "Invalid",
-                                })
+                egui::CollapsingHeader::new("Simulation")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Mode");
+                            let old_mode = simulation.game_mode;
+                            egui::ComboBox::from_id_salt("game_mode")
+                                .selected_text(simulation.game_mode.label())
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut simulation.brush_value, 0, "Empty");
-                                    ui.selectable_value(&mut simulation.brush_value, 1, "Rock");
-                                    ui.selectable_value(&mut simulation.brush_value, 2, "Paper");
-                                    ui.selectable_value(&mut simulation.brush_value, 3, "Scissors");
+                                    ui.selectable_value(
+                                        &mut simulation.game_mode,
+                                        GameMode::Rps,
+                                        GameMode::Rps.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut simulation.game_mode,
+                                        GameMode::Life,
+                                        GameMode::Life.label(),
+                                    );
                                 });
-                        }
-                        GameMode::Life => {
-                            egui::ComboBox::from_id_salt("brush_value")
-                                .selected_text(if simulation.brush_value == 1 {
-                                    "Live"
-                                } else {
-                                    "Dead"
-                                })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut simulation.brush_value, 1, "Live");
-                                    ui.selectable_value(&mut simulation.brush_value, 2, "Dead");
-                                });
-                            if simulation.brush_value != 1 && simulation.brush_value != 2 {
-                                simulation.brush_value = 1;
+                            if simulation.game_mode != old_mode {
+                                action.reset_requested = true;
                             }
+                        });
+                        ui.horizontal(|ui| {
+                            let label = if simulation.running { "Pause" } else { "Run" };
+                            if ui.button(label).clicked() {
+                                if !simulation.running {
+                                    simulation.clear_undo();
+                                    simulation.cancel_brush_unit();
+                                }
+                                simulation.running = !simulation.running;
+                            }
+
+                            if ui
+                                .add_enabled(!simulation.running, egui::Button::new("Step"))
+                                .clicked()
+                            {
+                                simulation.step_once = true;
+                            }
+                        });
+
+                        ui.add(
+                            egui::Slider::new(
+                                &mut simulation.target_steps_per_second,
+                                1.0..=REASONABLE_MAX_TARGET_STEPS_PER_SECOND,
+                            )
+                            .text("target steps / second")
+                            .clamping(egui::SliderClamping::Never),
+                        );
+
+                        ui.add(
+                            egui::Slider::new(
+                                &mut simulation.max_simulation_steps_per_tick,
+                                1..=REASONABLE_MAX_SIMULATION_STEPS_PER_TICK,
+                            )
+                            .text("max steps / tick")
+                            .clamping(egui::SliderClamping::Never),
+                        );
+
+                        ui.label(format!("Generation: {}", simulation.generation));
+                    });
+
+                egui::CollapsingHeader::new("Map")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(format!("Seed: {}", simulation.seed));
+                        ui.horizontal(|ui| {
+                            ui.label("Set seed");
+                            ui.text_edit_singleline(&mut simulation.pending_seed);
+                        });
+                        let seed_is_valid =
+                            simulation.pending_seed.trim().parse::<u64>().is_ok();
+                        ui.add(
+                            egui::Slider::new(
+                                &mut simulation.cluster_size,
+                                1..=REASONABLE_MAX_STARTUP_CLUSTER_SIZE,
+                            )
+                            .text("startup cluster size")
+                            .clamping(egui::SliderClamping::Never),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(seed_is_valid, egui::Button::new("Reset map"))
+                                .clicked()
+                            {
+                                action.reset_requested = true;
+                            }
+                            if ui.button("Random seed").clicked() {
+                                simulation.pending_seed = random_seed().to_string();
+                                action.reset_requested = true;
+                            }
+                        });
+                        if !seed_is_valid {
+                            ui.label("Seed must be a whole number");
                         }
-                    }
-                    if ui
-                        .add_enabled(
-                            !simulation.undo_stack.is_empty(),
-                            egui::Button::new("Undo brush"),
-                        )
-                        .clicked()
-                    {
-                        action.undo_requested = true;
-                    }
-                });
-                if simulation.running {
-                    ui.label("Pause to paint; running clears brush undo history");
-                } else {
-                    ui.label("Left-drag paints into the simulation grid");
-                }
-                ui.label(format!("Generation: {}", simulation.generation));
-                ui.label(format!(
-                    "Steps: {:.1} / second",
-                    simulation.measured_steps_per_second
-                ));
-                ui.label(format!("Frame: {:.2} ms", frame_stats.frame_time_ms));
-                ui.label(format!(
-                    "FPS: {:.1} presented / second",
-                    frame_stats.measured_frames_per_second
-                ));
-                ui.checkbox(&mut frame_stats.show_fps_counter, "Show FPS counter");
-                ui.checkbox(&mut simulation.show_steps_counter, "Show steps counter");
-                match simulation.game_mode {
-                    GameMode::Rps => ui.label("Red = rock, green = paper, blue = scissors"),
-                    GameMode::Life => ui.label("White = live, black = dead"),
-                };
+                    });
+
+                egui::CollapsingHeader::new("Brush")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.add_enabled_ui(!simulation.running, |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut simulation.brush_radius, 0..=128)
+                                    .text("radius"),
+                            );
+                            match simulation.game_mode {
+                                GameMode::Rps => {
+                                    egui::ComboBox::from_id_salt("brush_value")
+                                        .selected_text(match simulation.brush_value {
+                                            0 => "Empty",
+                                            1 => "Rock",
+                                            2 => "Paper",
+                                            3 => "Scissors",
+                                            _ => "Invalid",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut simulation.brush_value,
+                                                0,
+                                                "Empty",
+                                            );
+                                            ui.selectable_value(
+                                                &mut simulation.brush_value,
+                                                1,
+                                                "Rock",
+                                            );
+                                            ui.selectable_value(
+                                                &mut simulation.brush_value,
+                                                2,
+                                                "Paper",
+                                            );
+                                            ui.selectable_value(
+                                                &mut simulation.brush_value,
+                                                3,
+                                                "Scissors",
+                                            );
+                                        });
+                                }
+                                GameMode::Life => {
+                                    egui::ComboBox::from_id_salt("brush_value")
+                                        .selected_text(if simulation.brush_value == 1 {
+                                            "Live"
+                                        } else {
+                                            "Dead"
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut simulation.brush_value,
+                                                1,
+                                                "Live",
+                                            );
+                                            ui.selectable_value(
+                                                &mut simulation.brush_value,
+                                                2,
+                                                "Dead",
+                                            );
+                                        });
+                                    if simulation.brush_value != 1
+                                        && simulation.brush_value != 2
+                                    {
+                                        simulation.brush_value = 1;
+                                    }
+                                }
+                            }
+                            if ui
+                                .add_enabled(
+                                    !simulation.undo_stack.is_empty(),
+                                    egui::Button::new("Undo brush"),
+                                )
+                                .clicked()
+                            {
+                                action.undo_requested = true;
+                            }
+                        });
+                        if simulation.running {
+                            ui.label("Pause to paint; running clears brush undo history");
+                        } else {
+                            ui.label("Left-drag paints into the simulation grid");
+                        }
+                    });
+
+                egui::CollapsingHeader::new("Info")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.separator();
+                        match simulation.game_mode {
+                            GameMode::Rps => {
+                                ui.label("Red = rock, green = paper, blue = scissors")
+                            }
+                            GameMode::Life => {
+                                ui.label("White = live, black = dead")
+                            }
+                        };
+                        ui.label(format!(
+                            "Steps: {:.1} / second",
+                            simulation.measured_steps_per_second
+                        ));
+                        ui.label(format!(
+                            "Frame: {:.2} ms",
+                            frame_stats.frame_time_ms
+                        ));
+                        ui.label(format!(
+                            "FPS: {:.1} presented / second",
+                            frame_stats.measured_frames_per_second
+                        ));
+                        ui.label(format!(
+                            "Grid: {} x {} cells",
+                            simulation.size.width, simulation.size.height
+                        ));
+                        ui.label(format!(
+                            "View: {:.1}x zoom, offset {:.3}, {:.3}",
+                            simulation.view_scale,
+                            simulation.view_offset[0],
+                            simulation.view_offset[1]
+                        ));
+                        ui.label("Mouse wheel zooms; WASD or arrows move the view");
+                    });
             });
 
-        if frame_stats.show_fps_counter {
-            egui::Area::new("fps_counter".into())
+        if frame_stats.show_fps_counter || simulation.show_steps_counter {
+            egui::Area::new("counters".into())
                 .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
                 .interactable(false)
                 .show(ctx, |ui| {
                     egui::Frame::window(ui.style())
-                        .inner_margin(egui::Margin::same(8))
+                        .inner_margin(egui::Margin::same(4))
                         .show(ui, |ui| {
-                            ui.label(format!(
-                                "FPS: {:.1}",
-                                frame_stats.measured_frames_per_second
-                            ));
-                        });
-                });
-        }
-
-        if simulation.show_steps_counter {
-            egui::Area::new("steps_counter".into())
-                .anchor(egui::Align2::RIGHT_TOP, [-12.0, 56.0])
-                .interactable(false)
-                .show(ctx, |ui| {
-                    egui::Frame::window(ui.style())
-                        .inner_margin(egui::Margin::same(8))
-                        .show(ui, |ui| {
-                            ui.label(format!(
-                                "Steps: {:.1}/s",
-                                simulation.measured_steps_per_second
-                            ));
+                            ui.set_min_width(80.0);
+                            if frame_stats.show_fps_counter {
+                                ui.label(format!(
+                                    "FPS: {:.1}",
+                                    frame_stats.measured_frames_per_second
+                                ));
+                            }
+                            if simulation.show_steps_counter {
+                                ui.label(format!(
+                                    "Steps: {:.1}/s",
+                                    simulation.measured_steps_per_second
+                                ));
+                            }
                         });
                 });
         }
