@@ -20,10 +20,13 @@ mod pipelines;
 use brush::{BrushEdit, BrushStroke, MAX_BRUSH_EDITS};
 use pipelines::{GameMode, ScreenSize, Shaders};
 
-const GRID_SIZE: ScreenSize = ScreenSize {
+const DEFAULT_GRID_SIZE: ScreenSize = ScreenSize {
     width: 1024,
     height: 1024,
 };
+
+const MIN_GRID_DIMENSION: u32 = 1;
+const MAX_GRID_DIMENSION: u32 = 8192;
 
 const MIN_VIEW_SCALE: f32 = 1.0;
 const MAX_VIEW_SCALE: f32 = 128.0;
@@ -49,8 +52,9 @@ impl NavigationInput {
 }
 
 struct Simulation {
-    shaders: Shaders,
+    shaders: Option<Shaders>,
     size: ScreenSize,
+    pending_size: ScreenSize,
     view_offset: [f32; 2],
     view_scale: f32,
     cursor_uv: Option<[f32; 2]>,
@@ -135,13 +139,14 @@ impl Simulation {
         surface_format: wgpu::TextureFormat,
         config: StartupConfig,
     ) -> Self {
-        let contents = initial_board(GRID_SIZE, config.seed, config.cluster_size, GameMode::Rps);
-        let shaders = Shaders::new(device, GRID_SIZE, &contents, surface_format);
+        let contents = initial_board(config.size, config.seed, config.cluster_size, GameMode::Rps);
+        let shaders = Shaders::new(device, config.size, &contents, surface_format);
         let now = Instant::now();
 
         Self {
-            shaders,
-            size: GRID_SIZE,
+            shaders: Some(shaders),
+            size: config.size,
+            pending_size: config.size,
             view_offset: [0.0, 0.0],
             view_scale: 1.0,
             cursor_uv: None,
@@ -170,31 +175,59 @@ impl Simulation {
         }
     }
 
-    fn reset(&mut self, queue: &wgpu::Queue) {
+    fn reset(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface_format: wgpu::TextureFormat,
+    ) {
         let seed = self.pending_seed.trim().parse().unwrap_or(self.seed);
         let cluster_size = self.cluster_size.max(1);
-        let contents = initial_board(self.size, seed, cluster_size, self.game_mode);
-        self.shaders.reset(queue, &contents);
-        self.shaders.set_game_mode(queue, self.game_mode);
+        let size = ScreenSize {
+            width: self.pending_size.width.clamp(MIN_GRID_DIMENSION, MAX_GRID_DIMENSION),
+            height: self.pending_size.height.clamp(MIN_GRID_DIMENSION, MAX_GRID_DIMENSION),
+        };
+        let contents = initial_board(size, seed, cluster_size, self.game_mode);
+
+        if size != self.size {
+            drop(self.shaders.take());
+            self.shaders = Some(Shaders::new(device, size, &contents, surface_format));
+        } else {
+            self.shaders_mut().reset(queue, &contents);
+        }
+        self.shaders().set_game_mode(queue, self.game_mode);
 
         let now = Instant::now();
         self.seed = seed;
         self.pending_seed = seed.to_string();
+        self.size = size;
+        self.pending_size = size;
         self.cluster_size = cluster_size;
         self.step_once = false;
         self.measured_steps_per_second = 0.0;
         self.steps_in_sample = 0;
         self.generation = 0;
-        self.brush_down = false;
-        self.last_brush_cell = None;
-        self.in_progress_brush_strokes.clear();
-        self.undo_stack.clear();
+        self.reset_view(queue);
+        self.clear_undo();
+        self.cancel_brush_unit();
         self.next_step_at = now;
         self.step_sample_started_at = now;
         println!(
-            "map seed: {} (cluster size: {})",
-            self.seed, self.cluster_size
+            "map seed: {} (cluster size: {}, size: {}x{})",
+            self.seed, self.cluster_size, self.size.width, self.size.height
         );
+    }
+
+    fn shaders(&self) -> &Shaders {
+        self.shaders
+            .as_ref()
+            .expect("simulation shaders should always be initialized")
+    }
+
+    fn shaders_mut(&mut self) -> &mut Shaders {
+        self.shaders
+            .as_mut()
+            .expect("simulation shaders should always be initialized")
     }
 
     fn update_cursor_for_window(
@@ -312,8 +345,14 @@ impl Simulation {
     }
 
     fn write_view(&self, queue: &wgpu::Queue) {
-        self.shaders
+        self.shaders()
             .set_view(queue, self.view_offset, self.view_scale);
+    }
+
+    fn reset_view(&mut self, queue: &wgpu::Queue) {
+        self.view_offset = [0.0, 0.0];
+        self.view_scale = 1.0;
+        self.write_view(queue);
     }
 
     fn cursor_cell(&self) -> Option<(u32, u32)> {
@@ -457,6 +496,7 @@ impl Simulation {
 struct StartupConfig {
     seed: u64,
     cluster_size: u32,
+    size: ScreenSize,
     perfect_vsync: bool,
 }
 
@@ -464,6 +504,7 @@ impl StartupConfig {
     fn from_args() -> Result<Self, String> {
         let mut seed = None;
         let mut cluster_size = 24;
+        let mut size = DEFAULT_GRID_SIZE;
         let mut perfect_vsync = false;
         let mut args = env::args().skip(1);
 
@@ -481,12 +522,26 @@ impl StartupConfig {
                         .ok_or_else(|| format!("missing value after {arg}"))?;
                     cluster_size = parse_u32_arg("cluster-size", &value)?.max(1);
                 }
+                "--width" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| format!("missing value after {arg}"))?;
+                    size.width = parse_u32_arg("width", &value)?
+                        .clamp(MIN_GRID_DIMENSION, MAX_GRID_DIMENSION);
+                }
+                "--height" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| format!("missing value after {arg}"))?;
+                    size.height = parse_u32_arg("height", &value)?
+                        .clamp(MIN_GRID_DIMENSION, MAX_GRID_DIMENSION);
+                }
                 "--pv" => {
                     perfect_vsync = true;
                 }
                 "--help" | "-h" => {
                     return Err(
-                        "usage: cellular-automata [--seed <u64>] [--cluster-size <u32>] [--pv]"
+                        "usage: cellular-automata [--seed <u64>] [--cluster-size <u32>] [--width <u32>] [--height <u32>] [--pv]"
                             .to_string(),
                     );
                 }
@@ -497,6 +552,7 @@ impl StartupConfig {
         Ok(Self {
             seed: seed.unwrap_or_else(random_seed),
             cluster_size,
+            size,
             perfect_vsync,
         })
     }
@@ -881,6 +937,21 @@ impl GpuState {
                             .clamping(egui::SliderClamping::Never),
                         );
                         ui.horizontal(|ui| {
+                            ui.label("Grid size");
+                            ui.add(
+                                egui::DragValue::new(&mut simulation.pending_size.width)
+                                    .range(MIN_GRID_DIMENSION..=MAX_GRID_DIMENSION)
+                                    .speed(1.0)
+                                    .prefix("w "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut simulation.pending_size.height)
+                                    .range(MIN_GRID_DIMENSION..=MAX_GRID_DIMENSION)
+                                    .speed(1.0)
+                                    .prefix("h "),
+                            );
+                        });
+                        ui.horizontal(|ui| {
                             if ui
                                 .add_enabled(seed_is_valid, egui::Button::new("Reset map"))
                                 .clicked()
@@ -1048,18 +1119,20 @@ impl GpuState {
     }
 
     fn reset_simulation(&mut self) {
-        self.simulation.reset(&self.queue);
+        self.simulation
+            .reset(&self.device, &self.queue, self.surface_config.format);
     }
 
     fn undo_brush(&mut self) {
         let Some(unit) = self.simulation.undo_stack.pop() else {
             return;
         };
+        let size = self.simulation.size;
         for stroke in unit.strokes.into_iter().rev() {
-            self.simulation.shaders.undo_brush_stroke(
+            self.simulation.shaders_mut().undo_brush_stroke(
                 &self.device,
                 &self.queue,
-                self.simulation.size,
+                size,
                 stroke,
             );
         }
@@ -1103,11 +1176,12 @@ impl GpuState {
         let edits = self
             .simulation
             .brush_edits_between(self.simulation.last_brush_cell, cell);
+        let size = self.simulation.size;
         self.simulation.last_brush_cell = Some(cell);
-        if let Some(stroke) = self.simulation.shaders.apply_brush_edits(
+        if let Some(stroke) = self.simulation.shaders_mut().apply_brush_edits(
             &self.device,
             &self.queue,
-            self.simulation.size,
+            size,
             &edits,
         ) {
             self.simulation.in_progress_brush_strokes.push(stroke);
@@ -1150,6 +1224,7 @@ impl GpuState {
     }
 
     fn run_simulation_step(&mut self, now: Instant) {
+        let mode = self.simulation.game_mode;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1161,8 +1236,8 @@ impl GpuState {
                 timestamp_writes: None,
             });
             self.simulation
-                .shaders
-                .compute_step(&mut compute_pass, self.simulation.game_mode);
+                .shaders_mut()
+                .compute_step(&mut compute_pass, mode);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -1185,7 +1260,7 @@ impl GpuState {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        self.simulation.shaders.render(&mut render_pass);
+        self.simulation.shaders().render(&mut render_pass);
     }
 
     fn render_egui_pass(

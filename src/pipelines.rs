@@ -4,7 +4,7 @@ use wgpu::util::DeviceExt;
 use crate::brush::{BrushEdit, BrushGpu, BrushStroke};
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ScreenSize {
     pub width: u32,
     pub height: u32,
