@@ -24,6 +24,7 @@ const MIN_VIEW_SCALE: f32 = 1.0;
 const MAX_VIEW_SCALE: f32 = 128.0;
 const WHEEL_ZOOM_STEP: f32 = 1.15;
 const PAN_SCREENS_PER_SECOND: f32 = 0.75;
+const MAX_SIMULATION_STEPS_PER_TICK: usize = 8;
 
 #[derive(Default)]
 struct NavigationInput {
@@ -137,6 +138,20 @@ impl Simulation {
     }
 
     fn handle_navigation_key(&mut self, key: &KeyEvent) -> bool {
+        if key.repeat && key.state == ElementState::Pressed {
+            return matches!(
+                key.physical_key,
+                PhysicalKey::Code(KeyCode::KeyA)
+                    | PhysicalKey::Code(KeyCode::ArrowLeft)
+                    | PhysicalKey::Code(KeyCode::KeyD)
+                    | PhysicalKey::Code(KeyCode::ArrowRight)
+                    | PhysicalKey::Code(KeyCode::KeyW)
+                    | PhysicalKey::Code(KeyCode::ArrowUp)
+                    | PhysicalKey::Code(KeyCode::KeyS)
+                    | PhysicalKey::Code(KeyCode::ArrowDown)
+            );
+        }
+
         let pressed = key.state == ElementState::Pressed;
         match key.physical_key {
             PhysicalKey::Code(KeyCode::KeyA) | PhysicalKey::Code(KeyCode::ArrowLeft) => {
@@ -254,7 +269,10 @@ impl Simulation {
         }
 
         if self.running {
-            self.next_step_at = now + self.step_interval();
+            let interval = self.step_interval();
+            while self.next_step_at <= now {
+                self.next_step_at += interval;
+            }
         } else {
             self.next_step_at = now;
         }
@@ -478,7 +496,8 @@ impl GpuState {
     fn draw_hud(ctx: &egui::Context, simulation: &mut Simulation) -> bool {
         let mut reset_requested = false;
 
-        egui::Window::new("Rock Paper Scissors")
+        egui::Window::new("")
+            .default_open(false)
             .default_pos([12.0, 12.0])
             .show(ctx, |ui| {
                 ui.label("GPU cellular automaton");
@@ -575,7 +594,25 @@ impl GpuState {
         self.simulation.update_keyboard_navigation(&self.queue, now)
     }
 
-    fn run_simulation_step(&mut self) {
+    fn run_due_simulation_steps(&mut self, now: Instant) -> bool {
+        let mut stepped = false;
+        for _ in 0..MAX_SIMULATION_STEPS_PER_TICK {
+            if !self.simulation.wants_step(now) {
+                break;
+            }
+
+            self.run_simulation_step(now);
+            stepped = true;
+        }
+
+        if stepped && self.simulation.wants_step(now) {
+            self.simulation.next_step_at = Instant::now();
+        }
+
+        stepped
+    }
+
+    fn run_simulation_step(&mut self, now: Instant) {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -590,7 +627,7 @@ impl GpuState {
         }
 
         self.queue.submit(Some(encoder.finish()));
-        self.simulation.record_step(Instant::now());
+        self.simulation.record_step(now);
     }
 
     fn render_simulation_pass(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
@@ -718,6 +755,17 @@ impl App {
             config,
         }
     }
+
+    fn tick_and_render(&mut self, window: &Window) {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+
+        let now = Instant::now();
+        gpu.update_keyboard_navigation(now);
+        gpu.run_due_simulation_steps(now);
+        gpu.render(window);
+    }
 }
 
 impl ApplicationHandler for App {
@@ -736,7 +784,7 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let Some(window) = self.window.as_ref() else {
+        let Some(window) = self.window.clone() else {
             return;
         };
         if id != window.id() {
@@ -746,7 +794,7 @@ impl ApplicationHandler for App {
         let consumed_by_egui = self
             .gpu
             .as_mut()
-            .is_some_and(|gpu| gpu.egui_state.on_window_event(window, &event).consumed);
+            .is_some_and(|gpu| gpu.egui_state.on_window_event(&window, &event).consumed);
 
         match event {
             WindowEvent::CloseRequested
@@ -761,12 +809,12 @@ impl ApplicationHandler for App {
             } => event_loop.exit(),
             WindowEvent::Resized(_) => {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.resize(window);
+                    gpu.resize(&window);
                 }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.resize(window);
+                    gpu.resize(&window);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -777,52 +825,37 @@ impl ApplicationHandler for App {
             WindowEvent::MouseWheel { delta, .. } if !consumed_by_egui => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.handle_mouse_wheel(delta);
-                    window.request_redraw();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let Some(gpu) = self.gpu.as_mut()
                     && (!consumed_by_egui || event.state == ElementState::Released)
                 {
-                    if gpu.handle_navigation_key(&event) {
-                        window.request_redraw();
-                    }
+                    gpu.handle_navigation_key(&event);
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.render(window);
-                }
+                let Some(gpu) = self.gpu.as_mut() else {
+                    return;
+                };
+
+                let now = Instant::now();
+                gpu.update_keyboard_navigation(now);
+                gpu.run_due_simulation_steps(now);
+                gpu.render(&window);
             }
-            _ if consumed_by_egui => window.request_redraw(),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let (Some(window), Some(gpu)) = (self.window.as_ref(), self.gpu.as_mut()) else {
+        let Some(window) = self.window.clone() else {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
 
-        let now = Instant::now();
-        let view_moved = gpu.update_keyboard_navigation(now);
-        if view_moved {
-            window.request_redraw();
-        }
-
-        if gpu.simulation.wants_step(now) {
-            gpu.run_simulation_step();
-            window.request_redraw();
-        }
-
-        if gpu.simulation.navigation.any_pressed() {
-            event_loop.set_control_flow(ControlFlow::Poll);
-        } else if gpu.simulation.running {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(gpu.simulation.next_step_at));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
-        }
+        event_loop.set_control_flow(ControlFlow::Poll);
+        self.tick_and_render(window.as_ref());
     }
 }
 
@@ -837,7 +870,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Wait);
+    event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::new(config);
     event_loop.run_app(&mut app)?;
