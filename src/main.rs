@@ -321,12 +321,14 @@ impl Simulation {
 struct StartupConfig {
     seed: u64,
     cluster_size: u32,
+    perfect_vsync: bool,
 }
 
 impl StartupConfig {
     fn from_args() -> Result<Self, String> {
         let mut seed = None;
         let mut cluster_size = 24;
+        let mut perfect_vsync = false;
         let mut args = env::args().skip(1);
 
         while let Some(arg) = args.next() {
@@ -343,9 +345,12 @@ impl StartupConfig {
                         .ok_or_else(|| format!("missing value after {arg}"))?;
                     cluster_size = parse_u32_arg("cluster-size", &value)?.max(1);
                 }
+                "--pv" => {
+                    perfect_vsync = true;
+                }
                 "--help" | "-h" => {
                     return Err(
-                        "usage: cellular-automata [--seed <u64>] [--cluster-size <u32>]"
+                        "usage: cellular-automata [--seed <u64>] [--cluster-size <u32>] [--pv]"
                             .to_string(),
                     );
                 }
@@ -356,6 +361,7 @@ impl StartupConfig {
         Ok(Self {
             seed: seed.unwrap_or_else(random_seed),
             cluster_size,
+            perfect_vsync,
         })
     }
 }
@@ -426,19 +432,29 @@ struct GpuState {
 
 impl GpuState {
     async fn new(window: Arc<Window>, config: StartupConfig) -> Result<Self, anyhow::Error> {
-        let requested_backends = wgpu::Backends::all().with_env();
+        let requested_backends = if config.perfect_vsync {
+            wgpu::Backends::VULKAN
+        } else {
+            wgpu::Backends::all().with_env()
+        };
         let strict_backend = env::var_os("CELLULAR_AUTOMATA_STRICT_BACKEND").is_some();
-        let (surface, adapter) = match Self::request_adapter(window.clone(), requested_backends)
-            .await
+        let (surface, adapter) = match Self::request_adapter(
+            window.clone(),
+            requested_backends,
+            config.perfect_vsync,
+        )
+        .await
         {
             Ok(pair) => pair,
-            Err(error) if wgpu::Backends::from_env().is_some() && !strict_backend => {
+            Err(error)
+                if !config.perfect_vsync && wgpu::Backends::from_env().is_some() && !strict_backend =>
+            {
                 eprintln!(
                     "requested WGPU_BACKEND={:?} is not usable with this window surface: {error}",
                     env::var("WGPU_BACKEND").unwrap_or_default()
                 );
                 eprintln!("falling back to the default native wgpu backends");
-                Self::request_adapter(window.clone(), wgpu::Backends::PRIMARY).await?
+                Self::request_adapter(window.clone(), wgpu::Backends::PRIMARY, false).await?
             }
             Err(error) => return Err(error),
         };
@@ -462,13 +478,29 @@ impl GpuState {
             .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(surface_caps.formats[0]);
 
+        let present_mode = if config.perfect_vsync {
+            surface_caps
+                .present_modes
+                .iter()
+                .copied()
+                .find(|mode| *mode == wgpu::PresentMode::Fifo)
+                .ok_or_else(|| anyhow::anyhow!("selected surface does not support FIFO present mode"))?
+        } else {
+            surface_caps
+                .present_modes
+                .iter()
+                .copied()
+                .find(|mode| *mode == wgpu::PresentMode::Fifo)
+                .unwrap_or(surface_caps.present_modes[0])
+        };
+
         let size = window.inner_size();
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: surface_caps.present_modes[0],
+            present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -510,6 +542,7 @@ impl GpuState {
     async fn request_adapter(
         window: Arc<Window>,
         backends: wgpu::Backends,
+        prefer_intel_vulkan: bool,
     ) -> Result<(wgpu::Surface<'static>, wgpu::Adapter), anyhow::Error> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
@@ -518,18 +551,38 @@ impl GpuState {
             ..Default::default()
         });
         let surface = instance.create_surface(window)?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "no adapter for backends {backends:?} compatible with surface: {error}"
-                )
-            })?;
+        let adapter = if prefer_intel_vulkan {
+            instance
+                .enumerate_adapters(backends)
+                .into_iter()
+                .find(|adapter| {
+                    let info = adapter.get_info();
+                    let is_intel =
+                        info.vendor == 0x8086 || info.name.to_ascii_lowercase().contains("intel");
+
+                    info.backend == wgpu::Backend::Vulkan
+                        && is_intel
+                        && adapter.is_surface_supported(&surface)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no Intel Vulkan adapter compatible with surface for backends {backends:?}"
+                    )
+                })?
+        } else {
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: Some(&surface),
+                    force_fallback_adapter: false,
+                })
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "no adapter for backends {backends:?} compatible with surface: {error}"
+                    )
+                })?
+        };
 
         Ok((surface, adapter))
     }
@@ -1008,8 +1061,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
     })?;
     println!(
-        "map seed: {} (cluster size: {})",
-        config.seed, config.cluster_size
+        "map seed: {} (cluster size: {}, perfect vsync: {})",
+        config.seed, config.cluster_size, config.perfect_vsync
     );
 
     let event_loop = EventLoop::new()?;

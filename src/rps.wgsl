@@ -48,7 +48,54 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     output_grid[id.x]=input_grid[id.x];
     
-    var score = 0;
+    /*
+    var score = 0.0;
+    for(var dy:i32 = -2; dy<=2;dy++){
+        for(var dx:i32 = -2; dx<=2;dx++){
+            if(dx==0 && dy==0) {continue;}
+
+            let new_x = i32(x)+dx;
+            let new_y = i32(y)+dy;
+
+            if(new_x<0 || u32(new_x)>params.width) {continue;}
+            if(new_y<0 || u32(new_y)>params.height) {continue;}
+
+            let other_idx = u32(new_x)+u32(new_y)*params.width;
+
+            let ans = compute_rps(input_grid[id.x],input_grid[other_idx]);
+            if(ans>0){
+                score += f32(ans)/f32(dx*dx+dy*dy);
+            }
+        }
+    }
+
+    if(score<2.55){
+        return;
+    }
+
+    for(var dy:i32 = -2; dy<4;dy++){
+        for(var dx:i32 = -2; dx<4;dx++){
+            if(dx==0 && dy==0) {continue;}
+
+            let new_x = i32(x)+dx;
+            let new_y = i32(y)+dy;
+
+            if(new_x<0 || u32(new_x)>params.width) {continue;}
+            if(new_y<0 || u32(new_y)>params.height) {continue;}
+
+            let other_idx = u32(new_x)+u32(new_y)*params.width;
+
+            let ans = compute_rps(input_grid[id.x],input_grid[other_idx]);
+            if(ans==1){
+                output_grid[id.x]=input_grid[other_idx];
+                return;
+            }
+        }
+    }
+    */
+
+    /*
+    var score = 0.0;
     for(var dy:i32 = -1; dy<2;dy++){
         for(var dx:i32 = -1; dx<2;dx++){
             if(dx==0 && dy==0) {continue;}
@@ -63,12 +110,12 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
             let ans = compute_rps(input_grid[id.x],input_grid[other_idx]);
             if(ans>0){
-                score += ans;
+                score += f32(ans)/f32(dy*dy+dx*dx);
             }
         }
     }
 
-    if(score<3){
+    if(score<2.0){
         return;
     }
 
@@ -91,6 +138,51 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
     }
+    */
+    
+    var score = 0;
+    for(var dy:i32 = -1; dy<=1;dy++){
+        for(var dx:i32 = -1; dx<=1;dx++){
+            if(dx==0 && dy==0) {continue;}
 
+            let new_x = i32(x)+dx;
+            let new_y = i32(y)+dy;
+
+            if(new_x<0 || u32(new_x)>params.width) {continue;}
+            if(new_y<0 || u32(new_y)>params.height) {continue;}
+
+            let other_idx = u32(new_x)+u32(new_y)*params.width;
+
+            let ans = compute_rps(input_grid[id.x],input_grid[other_idx]);
+            if(ans>0){
+                score += ans;
+            }
+        }
+    }
+
+    if(score<3){
+        return;
+    }
+
+    for(var dy:i32 = -1; dy<=1;dy++){
+        for(var dx:i32 = -1; dx<=1;dx++){
+            if(dx==0 && dy==0) {continue;}
+
+            let new_x = i32(x)+dx;
+            let new_y = i32(y)+dy;
+
+            if(new_x<0 || u32(new_x)>params.width) {continue;}
+            if(new_y<0 || u32(new_y)>params.height) {continue;}
+
+            let other_idx = u32(new_x)+u32(new_y)*params.width;
+
+            let ans = compute_rps(input_grid[id.x],input_grid[other_idx]);
+            if(ans==1){
+                output_grid[id.x]=input_grid[other_idx];
+                return;
+            }
+        }
+    }
+    
     
 }
