@@ -57,12 +57,50 @@ struct Simulation {
     measured_steps_per_second: f32,
     steps_in_sample: u32,
     generation: u64,
-    frame_time_ms: f32,
-    show_fps_counter: bool,
     show_steps_counter: bool,
-    last_frame: Instant,
     next_step_at: Instant,
     step_sample_started_at: Instant,
+}
+
+struct FrameStats {
+    last_presented_at: Option<Instant>,
+    sample_started_at: Instant,
+    presented_frames_in_sample: u32,
+    frame_time_ms: f32,
+    measured_frames_per_second: f32,
+    show_fps_counter: bool,
+}
+
+impl FrameStats {
+    fn new() -> Self {
+        let now = Instant::now();
+
+        Self {
+            last_presented_at: None,
+            sample_started_at: now,
+            presented_frames_in_sample: 0,
+            frame_time_ms: 0.0,
+            measured_frames_per_second: 0.0,
+            show_fps_counter: false,
+        }
+    }
+
+    fn record_presented_frame(&mut self) {
+        let now = Instant::now();
+        if let Some(last_presented_at) = self.last_presented_at {
+            self.frame_time_ms = (now - last_presented_at).as_secs_f32() * 1_000.0;
+        }
+        self.last_presented_at = Some(now);
+
+        self.presented_frames_in_sample += 1;
+        let sample_time = now - self.sample_started_at;
+        if sample_time >= Duration::from_secs(1) {
+            self.measured_frames_per_second =
+                self.presented_frames_in_sample as f32 / sample_time.as_secs_f32();
+            self.presented_frames_in_sample = 0;
+            self.sample_started_at = now;
+        }
+    }
 }
 
 impl Simulation {
@@ -93,10 +131,7 @@ impl Simulation {
             measured_steps_per_second: 0.0,
             steps_in_sample: 0,
             generation: 0,
-            frame_time_ms: 0.0,
-            show_fps_counter: false,
             show_steps_counter: false,
-            last_frame: now,
             next_step_at: now,
             step_sample_started_at: now,
         }
@@ -122,12 +157,6 @@ impl Simulation {
             "map seed: {} (cluster size: {})",
             self.seed, self.cluster_size
         );
-    }
-
-    fn begin_frame(&mut self) {
-        let now = Instant::now();
-        self.frame_time_ms = (now - self.last_frame).as_secs_f32() * 1_000.0;
-        self.last_frame = now;
     }
 
     fn update_cursor_for_window(
@@ -387,6 +416,7 @@ struct GpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_config: wgpu::SurfaceConfiguration,
+    frame_stats: FrameStats,
     egui_context: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: Renderer,
@@ -396,15 +426,23 @@ struct GpuState {
 
 impl GpuState {
     async fn new(window: Arc<Window>, config: StartupConfig) -> Result<Self, anyhow::Error> {
-        let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window.clone()).unwrap();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await?;
+        let requested_backends = wgpu::Backends::all().with_env();
+        let strict_backend = env::var_os("CELLULAR_AUTOMATA_STRICT_BACKEND").is_some();
+        let (surface, adapter) = match Self::request_adapter(window.clone(), requested_backends)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(error) if wgpu::Backends::from_env().is_some() && !strict_backend => {
+                eprintln!(
+                    "requested WGPU_BACKEND={:?} is not usable with this window surface: {error}",
+                    env::var("WGPU_BACKEND").unwrap_or_default()
+                );
+                eprintln!("falling back to the default native wgpu backends");
+                Self::request_adapter(window.clone(), wgpu::Backends::PRIMARY).await?
+            }
+            Err(error) => return Err(error),
+        };
+        let adapter_info = adapter.get_info();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("main device"),
@@ -436,6 +474,20 @@ impl GpuState {
             desired_maximum_frame_latency: 2,
         };
 
+        println!("wgpu adapter: {adapter_info:#?}");
+        println!("surface formats: {:?}", surface_caps.formats);
+        println!("surface present modes: {:?}", surface_caps.present_modes);
+        println!("surface alpha modes: {:?}", surface_caps.alpha_modes);
+        println!(
+            "selected surface config: format={:?}, present_mode={:?}, alpha_mode={:?}, size={}x{}, desired_maximum_frame_latency={}",
+            surface_config.format,
+            surface_config.present_mode,
+            surface_config.alpha_mode,
+            surface_config.width,
+            surface_config.height,
+            surface_config.desired_maximum_frame_latency
+        );
+
         surface.configure(&device, &surface_config);
 
         let (egui_context, egui_state, egui_renderer) =
@@ -447,11 +499,39 @@ impl GpuState {
             device,
             queue,
             surface_config,
+            frame_stats: FrameStats::new(),
             egui_context,
             egui_state,
             egui_renderer,
             simulation,
         })
+    }
+
+    async fn request_adapter(
+        window: Arc<Window>,
+        backends: wgpu::Backends,
+    ) -> Result<(wgpu::Surface<'static>, wgpu::Adapter), anyhow::Error> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
+            flags: wgpu::InstanceFlags::from_env_or_default(),
+            ..Default::default()
+        });
+        let surface = instance.create_surface(window)?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "no adapter for backends {backends:?} compatible with surface: {error}"
+                )
+            })?;
+
+        Ok((surface, adapter))
     }
 
     fn create_egui(
@@ -497,12 +577,16 @@ impl GpuState {
         let raw_input = self.egui_state.take_egui_input(window);
         let mut reset_requested = false;
         let output = self.egui_context.run(raw_input, |ctx| {
-            reset_requested = Self::draw_hud(ctx, &mut self.simulation);
+            reset_requested = Self::draw_hud(ctx, &mut self.simulation, &mut self.frame_stats);
         });
         (output, reset_requested)
     }
 
-    fn draw_hud(ctx: &egui::Context, simulation: &mut Simulation) -> bool {
+    fn draw_hud(
+        ctx: &egui::Context,
+        simulation: &mut Simulation,
+        frame_stats: &mut FrameStats,
+    ) -> bool {
         let mut reset_requested = false;
 
         egui::Window::new("")
@@ -577,19 +661,17 @@ impl GpuState {
                     "Steps: {:.1} / second",
                     simulation.measured_steps_per_second
                 ));
-                ui.label(format!("Frame: {:.2} ms", simulation.frame_time_ms));
-                ui.checkbox(&mut simulation.show_fps_counter, "Show FPS counter");
+                ui.label(format!("Frame: {:.2} ms", frame_stats.frame_time_ms));
+                ui.label(format!(
+                    "FPS: {:.1} presented / second",
+                    frame_stats.measured_frames_per_second
+                ));
+                ui.checkbox(&mut frame_stats.show_fps_counter, "Show FPS counter");
                 ui.checkbox(&mut simulation.show_steps_counter, "Show steps counter");
                 ui.label("Red = rock, green = paper, blue = scissors");
             });
 
-        if simulation.show_fps_counter {
-            let fps = if simulation.frame_time_ms > 0.0 {
-                1_000.0 / simulation.frame_time_ms
-            } else {
-                0.0
-            };
-
+        if frame_stats.show_fps_counter {
             egui::Area::new("fps_counter".into())
                 .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
                 .interactable(false)
@@ -597,7 +679,10 @@ impl GpuState {
                     egui::Frame::window(ui.style())
                         .inner_margin(egui::Margin::same(8))
                         .show(ui, |ui| {
-                            ui.label(format!("FPS: {:.1}", fps));
+                            ui.label(format!(
+                                "FPS: {:.1}",
+                                frame_stats.measured_frames_per_second
+                            ));
                         });
                 });
         }
@@ -749,7 +834,6 @@ impl GpuState {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        self.simulation.begin_frame();
         let (full_output, reset_requested) = self.run_hud(window);
         self.egui_state
             .handle_platform_output(window, full_output.platform_output);
@@ -794,6 +878,7 @@ impl GpuState {
 
         self.queue.submit(Some(encoder.finish()));
         output.present();
+        self.frame_stats.record_presented_frame();
     }
 }
 
@@ -836,7 +921,15 @@ impl ApplicationHandler for App {
                 .create_window(Window::default_attributes().with_title("cellular automata"))
                 .unwrap(),
         );
-        self.gpu = Some(pollster::block_on(GpuState::new(window.clone(), self.config)).unwrap());
+        let gpu = match pollster::block_on(GpuState::new(window.clone(), self.config)) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("failed to initialize GPU: {error:#}");
+                event_loop.exit();
+                return;
+            }
+        };
+        self.gpu = Some(gpu);
         self.window = Some(window);
     }
 

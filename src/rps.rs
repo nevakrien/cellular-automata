@@ -364,6 +364,17 @@ impl RpsShaders {
             }),
         ];
 
+        println!(
+            "rps pipelines: grid={}x{}, board_bytes={}, compute_workgroups_per_step={}, render_format={:?}, render_topology={:?}, render_samples={}, render_draw=3 vertices",
+            size.width,
+            size.height,
+            rw_buffers[0].size(),
+            (rw_buffers[0].size() as u32 / 4).div_ceil(256),
+            surface_format,
+            wgpu::PrimitiveTopology::TriangleList,
+            wgpu::MultisampleState::default().count
+        );
+
         Self {
             compute_pipeline,
             _size: size_buffer,
