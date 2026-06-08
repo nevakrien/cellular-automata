@@ -11,11 +11,11 @@ use egui_winit::winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use egui_winit::winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use egui_winit::winit::window::{Window, WindowId};
 
-mod rps;
+mod pipelines;
 
-use rps::{RpsParams, RpsShaders};
+use pipelines::{GameMode, ScreenSize, Shaders};
 
-const GRID_SIZE: RpsParams = RpsParams {
+const GRID_SIZE: ScreenSize = ScreenSize {
     width: 1024,
     height: 1024,
 };
@@ -44,8 +44,8 @@ impl NavigationInput {
 }
 
 struct Simulation {
-    shaders: RpsShaders,
-    size: RpsParams,
+    shaders: Shaders,
+    size: ScreenSize,
     view_offset: [f32; 2],
     view_scale: f32,
     cursor_uv: Option<[f32; 2]>,
@@ -54,6 +54,7 @@ struct Simulation {
     seed: u64,
     pending_seed: String,
     cluster_size: u32,
+    game_mode: GameMode,
     running: bool,
     step_once: bool,
     target_steps_per_second: f32,
@@ -113,8 +114,8 @@ impl Simulation {
         surface_format: wgpu::TextureFormat,
         config: StartupConfig,
     ) -> Self {
-        let contents = initial_board(GRID_SIZE, config.seed, config.cluster_size);
-        let shaders = RpsShaders::new(device, GRID_SIZE, &contents, surface_format);
+        let contents = initial_board(GRID_SIZE, config.seed, config.cluster_size, GameMode::Rps);
+        let shaders = Shaders::new(device, GRID_SIZE, &contents, surface_format);
         let now = Instant::now();
 
         Self {
@@ -128,6 +129,7 @@ impl Simulation {
             seed: config.seed,
             pending_seed: config.seed.to_string(),
             cluster_size: config.cluster_size,
+            game_mode: GameMode::Rps,
             running: true,
             step_once: false,
             target_steps_per_second: 30.0,
@@ -144,8 +146,9 @@ impl Simulation {
     fn reset(&mut self, queue: &wgpu::Queue) {
         let seed = self.pending_seed.trim().parse().unwrap_or(self.seed);
         let cluster_size = self.cluster_size.max(1);
-        let contents = initial_board(self.size, seed, cluster_size);
+        let contents = initial_board(self.size, seed, cluster_size, self.game_mode);
         self.shaders.reset(queue, &contents);
+        self.shaders.set_game_mode(queue, self.game_mode);
 
         let now = Instant::now();
         self.seed = seed;
@@ -403,7 +406,7 @@ fn mix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn initial_board(size: RpsParams, seed: u64, cluster_size: u32) -> Vec<u32> {
+fn initial_board(size: ScreenSize, seed: u64, cluster_size: u32, game_mode: GameMode) -> Vec<u32> {
     let mut board = Vec::with_capacity(size.width as usize * size.height as usize);
     let cluster_size = cluster_size.max(1);
 
@@ -415,10 +418,19 @@ fn initial_board(size: RpsParams, seed: u64, cluster_size: u32) -> Vec<u32> {
                 seed ^ (cluster_x as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
                     ^ (cluster_y as u64).wrapping_mul(0xABC9_83AD_8EBC_8A63),
             );
-            let cell = match noise % 3 {
-                0 => 1,
-                1 => 2,
-                _ => 3,
+            let cell = match game_mode {
+                GameMode::Rps => match noise % 3 {
+                    0 => 1,
+                    1 => 2,
+                    _ => 3,
+                },
+                GameMode::Life => {
+                    if noise % 4 == 0 {
+                        1
+                    } else {
+                        2
+                    }
+                }
             };
             board.push(cell);
         }
@@ -457,7 +469,9 @@ impl GpuState {
         {
             Ok(pair) => pair,
             Err(error)
-                if !config.perfect_vsync && wgpu::Backends::from_env().is_some() && !strict_backend =>
+                if !config.perfect_vsync
+                    && wgpu::Backends::from_env().is_some()
+                    && !strict_backend =>
             {
                 eprintln!(
                     "requested WGPU_BACKEND={:?} is not usable with this window surface: {error}",
@@ -494,7 +508,9 @@ impl GpuState {
                 .iter()
                 .copied()
                 .find(|mode| *mode == wgpu::PresentMode::Fifo)
-                .ok_or_else(|| anyhow::anyhow!("selected surface does not support FIFO present mode"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("selected surface does not support FIFO present mode")
+                })?
         } else {
             surface_caps
                 .present_modes
@@ -659,6 +675,28 @@ impl GpuState {
                 ui.label("GPU cellular automaton");
                 ui.separator();
                 ui.horizontal(|ui| {
+                    ui.label("Mode");
+                    let old_mode = simulation.game_mode;
+                    egui::ComboBox::from_id_salt("game_mode")
+                        .selected_text(simulation.game_mode.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut simulation.game_mode,
+                                GameMode::Rps,
+                                GameMode::Rps.label(),
+                            );
+                            ui.selectable_value(
+                                &mut simulation.game_mode,
+                                GameMode::Life,
+                                GameMode::Life.label(),
+                            );
+                        });
+                    if simulation.game_mode != old_mode {
+                        reset_requested = true;
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
                     let label = if simulation.running { "Pause" } else { "Run" };
                     if ui.button(label).clicked() {
                         simulation.running = !simulation.running;
@@ -677,8 +715,8 @@ impl GpuState {
                         &mut simulation.target_steps_per_second,
                         1.0..=REASONABLE_MAX_TARGET_STEPS_PER_SECOND,
                     )
-                        .text("target steps / second")
-                        .clamping(egui::SliderClamping::Never),
+                    .text("target steps / second")
+                    .clamping(egui::SliderClamping::Never),
                 );
 
                 ui.add(
@@ -686,8 +724,8 @@ impl GpuState {
                         &mut simulation.max_simulation_steps_per_tick,
                         1..=REASONABLE_MAX_SIMULATION_STEPS_PER_TICK,
                     )
-                        .text("max steps / tick")
-                        .clamping(egui::SliderClamping::Never),
+                    .text("max steps / tick")
+                    .clamping(egui::SliderClamping::Never),
                 );
 
                 ui.separator();
@@ -702,8 +740,8 @@ impl GpuState {
                         &mut simulation.cluster_size,
                         1..=REASONABLE_MAX_STARTUP_CLUSTER_SIZE,
                     )
-                        .text("startup cluster size")
-                        .clamping(egui::SliderClamping::Never),
+                    .text("startup cluster size")
+                    .clamping(egui::SliderClamping::Never),
                 );
                 ui.horizontal(|ui| {
                     if ui
@@ -743,7 +781,10 @@ impl GpuState {
                 ));
                 ui.checkbox(&mut frame_stats.show_fps_counter, "Show FPS counter");
                 ui.checkbox(&mut simulation.show_steps_counter, "Show steps counter");
-                ui.label("Red = rock, green = paper, blue = scissors");
+                match simulation.game_mode {
+                    GameMode::Rps => ui.label("Red = rock, green = paper, blue = scissors"),
+                    GameMode::Life => ui.label("White = live, black = dead"),
+                };
             });
 
         if frame_stats.show_fps_counter {
@@ -839,7 +880,9 @@ impl GpuState {
                 label: Some("rps compute pass"),
                 timestamp_writes: None,
             });
-            self.simulation.shaders.compute_step(&mut compute_pass);
+            self.simulation
+                .shaders
+                .compute_step(&mut compute_pass, self.simulation.game_mode);
         }
 
         self.queue.submit(Some(encoder.finish()));

@@ -39,10 +39,11 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let x = id.x % params.width;
     let y = id.x/params.width;
 
-    if(y>params.width){
+    if(y>params.height){
         return;
     }
     if(input_grid[id.x]==0){
+        output_grid[id.x] = 0;
         return;
     }
 
@@ -57,8 +58,8 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
             let new_x = i32(x)+dx;
             let new_y = i32(y)+dy;
 
-            if(new_x<0 || u32(new_x)>params.width) {continue;}
-            if(new_y<0 || u32(new_y)>params.height) {continue;}
+            if(new_x<0 || u32(new_x)>=params.width) {continue;}
+            if(new_y<0 || u32(new_y)>=params.height) {continue;}
 
             let other_idx = u32(new_x)+u32(new_y)*params.width;
 
@@ -80,8 +81,8 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
             let new_x = i32(x)+dx;
             let new_y = i32(y)+dy;
 
-            if(new_x<0 || u32(new_x)>params.width) {continue;}
-            if(new_y<0 || u32(new_y)>params.height) {continue;}
+            if(new_x<0 || u32(new_x)>=params.width) {continue;}
+            if(new_y<0 || u32(new_y)>=params.height) {continue;}
 
             let other_idx = u32(new_x)+u32(new_y)*params.width;
 
@@ -103,8 +104,8 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
             let new_x = i32(x)+dx;
             let new_y = i32(y)+dy;
 
-            if(new_x<0 || u32(new_x)>params.width) {continue;}
-            if(new_y<0 || u32(new_y)>params.height) {continue;}
+            if(new_x<0 || u32(new_x)>=params.width) {continue;}
+            if(new_y<0 || u32(new_y)>=params.height) {continue;}
 
             let other_idx = u32(new_x)+u32(new_y)*params.width;
 
@@ -126,8 +127,8 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
             let new_x = i32(x)+dx;
             let new_y = i32(y)+dy;
 
-            if(new_x<0 || u32(new_x)>params.width) {continue;}
-            if(new_y<0 || u32(new_y)>params.height) {continue;}
+            if(new_x<0 || u32(new_x)>=params.width) {continue;}
+            if(new_y<0 || u32(new_y)>=params.height) {continue;}
 
             let other_idx = u32(new_x)+u32(new_y)*params.width;
 
@@ -148,8 +149,8 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
             let new_x = i32(x)+dx;
             let new_y = i32(y)+dy;
 
-            if(new_x<0 || u32(new_x)>params.width) {continue;}
-            if(new_y<0 || u32(new_y)>params.height) {continue;}
+            if(new_x<0 || u32(new_x)>=params.width) {continue;}
+            if(new_y<0 || u32(new_y)>=params.height) {continue;}
 
             let other_idx = u32(new_x)+u32(new_y)*params.width;
 
@@ -171,8 +172,8 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
             let new_x = i32(x)+dx;
             let new_y = i32(y)+dy;
 
-            if(new_x<0 || u32(new_x)>params.width) {continue;}
-            if(new_y<0 || u32(new_y)>params.height) {continue;}
+            if(new_x<0 || u32(new_x)>=params.width) {continue;}
+            if(new_y<0 || u32(new_y)>=params.height) {continue;}
 
             let other_idx = u32(new_x)+u32(new_y)*params.width;
 

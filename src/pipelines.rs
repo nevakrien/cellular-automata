@@ -3,7 +3,7 @@ use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct RpsParams {
+pub struct ScreenSize {
     pub width: u32,
     pub height: u32,
 }
@@ -22,11 +22,33 @@ pub struct DisplayColors {
     pub colors: [[f32; 4]; 4],
 }
 
-const DISPLAY_COLORS: [[f32; 4]; 4] = [
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GameMode {
+    Rps,
+    Life,
+}
+
+impl GameMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rps => "Rock Paper Scissors",
+            Self::Life => "Game of Life",
+        }
+    }
+}
+
+const RPS_DISPLAY_COLORS: [[f32; 4]; 4] = [
     [0.0, 0.0, 0.0, 1.0], // 0 empty
     [1.0, 0.1, 0.1, 1.0], // 1 rock
     [0.1, 0.8, 0.1, 1.0], // 2 paper
     [0.1, 0.2, 1.0, 1.0], // 3 scissors
+];
+
+const LIFE_DISPLAY_COLORS: [[f32; 4]; 4] = [
+    [1.0, 0.0, 1.0, 1.0], // 0 invalid for Life
+    [1.0, 1.0, 1.0, 1.0], // 1 live
+    [0.0, 0.0, 0.0, 1.0], // 2 dead
+    [1.0, 0.0, 1.0, 1.0], // 3 invalid for Life
 ];
 
 impl DisplayInfo {
@@ -39,8 +61,10 @@ impl DisplayInfo {
     }
 }
 
-pub struct RpsShaders {
-    compute_pipeline: wgpu::ComputePipeline,
+pub struct Shaders {
+    rps_compute_pipeline: wgpu::ComputePipeline,
+    life_compute_pipeline: wgpu::ComputePipeline,
+
     _size: wgpu::Buffer,
     rw_buffers: [wgpu::Buffer; 2],
     rw_groups: [wgpu::BindGroup; 2],
@@ -48,27 +72,32 @@ pub struct RpsShaders {
 
     render_pipeline: wgpu::RenderPipeline,
     display_info_buffer: wgpu::Buffer,
-    _display_colors_buffer: wgpu::Buffer,
+    display_colors_buffer: wgpu::Buffer,
     render_groups: [wgpu::BindGroup; 2],
 }
 
-impl RpsShaders {
+impl Shaders {
     pub fn new(
         device: &wgpu::Device,
-        size: RpsParams,
+        size: ScreenSize,
         contents: &[u32],
         surface_format: wgpu::TextureFormat,
     ) -> Self {
         assert_eq!(size.width as usize * size.height as usize, contents.len());
 
-        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let rps_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rps compute shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("rps.wgsl").into()),
         });
 
+        let life_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("life compute shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("life.wgsl").into()),
+        });
+
         let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rps render shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("rps_render.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("render.wgsl").into()),
         });
 
         // -------------------------
@@ -90,13 +119,13 @@ impl RpsShaders {
         });
 
         let display_colors = DisplayColors {
-            colors: DISPLAY_COLORS,
+            colors: RPS_DISPLAY_COLORS,
         };
 
         let display_colors_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("rps display colors uniform"),
             contents: bytemuck::bytes_of(&display_colors),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let board_usage = wgpu::BufferUsages::STORAGE
@@ -119,7 +148,7 @@ impl RpsShaders {
         // -------------------------
         // Compute pipeline + groups
         // group(0):
-        //   binding 0 = RpsParams uniform
+        //   binding 0 = ScreenSize uniform
         //   binding 1 = input storage read
         //   binding 2 = output storage read_write
         // -------------------------
@@ -168,14 +197,25 @@ impl RpsShaders {
                 push_constant_ranges: &[],
             });
 
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rps compute pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &compute_shader,
-            entry_point: Some("cs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let rps_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rps compute pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &rps_compute_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+        let life_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("life compute pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &life_compute_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
 
         let rw_groups = [
             // idx 0: read board 0, write board 1
@@ -221,7 +261,7 @@ impl RpsShaders {
         // -------------------------
         // Render pipeline + groups
         // group(0):
-        //   binding 0 = RpsParams uniform
+        //   binding 0 = ScreenSize uniform
         //   binding 1 = DisplayInfo uniform
         //   binding 2 = DisplayColors uniform
         //   binding 3 = input storage read
@@ -376,7 +416,9 @@ impl RpsShaders {
         );
 
         Self {
-            compute_pipeline,
+            rps_compute_pipeline,
+            life_compute_pipeline,
+
             _size: size_buffer,
             rw_buffers,
             rw_groups,
@@ -384,16 +426,19 @@ impl RpsShaders {
 
             render_pipeline,
             display_info_buffer,
-            _display_colors_buffer: display_colors_buffer,
+            display_colors_buffer,
             render_groups,
         }
     }
 
-    pub fn compute_step<'a>(&'a mut self, pass: &mut wgpu::ComputePass<'a>) {
+    pub fn compute_step<'a>(&'a mut self, pass: &mut wgpu::ComputePass<'a>, mode: GameMode) {
         let cell_count = self.rw_buffers[0].size() as u32 / 4; //size of a single cell is i32
         let workgroup_count = (cell_count + 255) / 256;
 
-        pass.set_pipeline(&self.compute_pipeline);
+        match mode {
+            GameMode::Rps => pass.set_pipeline(&self.rps_compute_pipeline),
+            GameMode::Life => pass.set_pipeline(&self.life_compute_pipeline),
+        }
         pass.set_bind_group(0, &self.rw_groups[self.idx], &[]);
         pass.dispatch_workgroups(workgroup_count, 1, 1);
 
@@ -406,6 +451,19 @@ impl RpsShaders {
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(contents));
         }
         self.idx = 0;
+    }
+
+    pub fn set_game_mode(&self, queue: &wgpu::Queue, mode: GameMode) {
+        let colors = match mode {
+            GameMode::Rps => RPS_DISPLAY_COLORS,
+            GameMode::Life => LIFE_DISPLAY_COLORS,
+        };
+        let display_colors = DisplayColors { colors };
+        queue.write_buffer(
+            &self.display_colors_buffer,
+            0,
+            bytemuck::bytes_of(&display_colors),
+        );
     }
 
     pub fn set_view(&self, queue: &wgpu::Queue, offset: [f32; 2], scale: f32) {
