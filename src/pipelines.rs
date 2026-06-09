@@ -123,10 +123,11 @@ impl Shaders {
             source: wgpu::ShaderSource::Wgsl(include_str!("super_rps.wgsl").into()),
         });
 
-        let two_paradox_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("two paradox compute shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("two_paradox.wgsl").into()),
-        });
+        let two_paradox_compute_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("two paradox compute shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("two_paradox.wgsl").into()),
+            });
 
         let life_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("life compute shader"),
@@ -137,7 +138,6 @@ impl Shaders {
             label: Some("rps render shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("render.wgsl").into()),
         });
-        let brush = BrushGpu::new(device);
 
         // -------------------------
         // Shared buffers
@@ -183,6 +183,7 @@ impl Shaders {
                 usage: board_usage,
             }),
         ];
+        let brush = BrushGpu::new(device, [&rw_buffers[0], &rw_buffers[1]]);
 
         // -------------------------
         // Compute pipeline + groups
@@ -521,34 +522,18 @@ impl Shaders {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        size: ScreenSize,
         edits: &[BrushEdit],
     ) -> Option<BrushStroke> {
-        self.brush.apply(
-            device,
-            queue,
-            [&self.rw_buffers[0], &self.rw_buffers[1]],
-            size,
-            self.idx,
-            edits,
-        )
+        self.brush.apply(device, queue, self.idx, edits)
     }
 
     pub fn undo_brush_stroke(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        size: ScreenSize,
         stroke: BrushStroke,
     ) {
-        self.brush.undo(
-            device,
-            queue,
-            [&self.rw_buffers[0], &self.rw_buffers[1]],
-            size,
-            self.idx,
-            stroke,
-        );
+        self.brush.undo(device, queue, self.idx, stroke);
     }
 
     pub fn set_game_mode(&self, queue: &wgpu::Queue, mode: GameMode) {

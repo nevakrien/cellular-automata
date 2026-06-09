@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,6 +36,7 @@ const PAN_SCREENS_PER_SECOND: f32 = 0.75;
 const REASONABLE_MAX_TARGET_STEPS_PER_SECOND: f32 = 240.0;
 const REASONABLE_MAX_SIMULATION_STEPS_PER_TICK: usize = 16;
 const REASONABLE_MAX_STARTUP_CLUSTER_SIZE: u32 = 128;
+const MAX_BRUSH_UNDO_UNITS: usize = 1_000;
 
 #[derive(Default)]
 struct NavigationInput {
@@ -79,7 +80,7 @@ struct Simulation {
     brush_down: bool,
     last_brush_cell: Option<(u32, u32)>,
     in_progress_brush_strokes: Vec<BrushStroke>,
-    undo_stack: Vec<BrushUndoUnit>,
+    undo_stack: VecDeque<BrushUndoUnit>,
 }
 
 struct FrameStats {
@@ -171,7 +172,7 @@ impl Simulation {
             brush_down: false,
             last_brush_cell: None,
             in_progress_brush_strokes: Vec::new(),
-            undo_stack: Vec::new(),
+            undo_stack: VecDeque::new(),
         }
     }
 
@@ -413,7 +414,7 @@ impl Simulation {
         cells
             .into_iter()
             .take(MAX_BRUSH_EDITS)
-            .map(|(x, y)| BrushEdit::new(x, y, self.brush_value))
+            .map(|(x, y)| BrushEdit::new(x + y * self.size.width, self.brush_value))
             .collect()
     }
 
@@ -441,7 +442,10 @@ impl Simulation {
 
     fn finish_brush_unit(&mut self) {
         if !self.in_progress_brush_strokes.is_empty() {
-            self.undo_stack.push(BrushUndoUnit {
+            if self.undo_stack.len() == MAX_BRUSH_UNDO_UNITS {
+                self.undo_stack.pop_front();
+            }
+            self.undo_stack.push_back(BrushUndoUnit {
                 strokes: std::mem::take(&mut self.in_progress_brush_strokes),
             });
         }
@@ -1167,17 +1171,13 @@ impl GpuState {
     }
 
     fn undo_brush(&mut self) {
-        let Some(unit) = self.simulation.undo_stack.pop() else {
+        let Some(unit) = self.simulation.undo_stack.pop_back() else {
             return;
         };
-        let size = self.simulation.size;
         for stroke in unit.strokes.into_iter().rev() {
-            self.simulation.shaders_mut().undo_brush_stroke(
-                &self.device,
-                &self.queue,
-                size,
-                stroke,
-            );
+            self.simulation
+                .shaders_mut()
+                .undo_brush_stroke(&self.device, &self.queue, stroke);
         }
     }
 
@@ -1219,12 +1219,11 @@ impl GpuState {
         let edits = self
             .simulation
             .brush_edits_between(self.simulation.last_brush_cell, cell);
-        let size = self.simulation.size;
         self.simulation.last_brush_cell = Some(cell);
         if let Some(stroke) =
             self.simulation
                 .shaders_mut()
-                .apply_brush_edits(&self.device, &self.queue, size, &edits)
+                .apply_brush_edits(&self.device, &self.queue, &edits)
         {
             self.simulation.in_progress_brush_strokes.push(stroke);
         }
