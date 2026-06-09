@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use egui_winit::winit::window::{Window, WindowId};
 mod brush;
 mod pipelines;
 
-use brush::{BrushEdit, BrushStroke, MAX_BRUSH_EDITS};
+use brush::{BrushEdit, BrushUndoStack, MAX_BRUSH_EDITS};
 use pipelines::{GameMode, ScreenSize, Shaders};
 
 const DEFAULT_GRID_SIZE: ScreenSize = ScreenSize {
@@ -36,8 +36,6 @@ const PAN_SCREENS_PER_SECOND: f32 = 0.75;
 const REASONABLE_MAX_TARGET_STEPS_PER_SECOND: f32 = 240.0;
 const REASONABLE_MAX_SIMULATION_STEPS_PER_TICK: usize = 16;
 const REASONABLE_MAX_STARTUP_CLUSTER_SIZE: u32 = 128;
-const MAX_BRUSH_UNDO_UNITS: usize = 1_000;
-
 #[derive(Default)]
 struct NavigationInput {
     left: bool,
@@ -79,8 +77,7 @@ struct Simulation {
     brush_radius: u32,
     brush_down: bool,
     last_brush_cell: Option<(u32, u32)>,
-    in_progress_brush_strokes: Vec<BrushStroke>,
-    undo_stack: VecDeque<BrushUndoUnit>,
+    brush_undo: BrushUndoStack,
 }
 
 struct FrameStats {
@@ -96,10 +93,6 @@ struct FrameStats {
 struct HudAction {
     reset_requested: bool,
     undo_requested: bool,
-}
-
-struct BrushUndoUnit {
-    strokes: Vec<BrushStroke>,
 }
 
 impl FrameStats {
@@ -171,8 +164,7 @@ impl Simulation {
             brush_radius: 4,
             brush_down: false,
             last_brush_cell: None,
-            in_progress_brush_strokes: Vec::new(),
-            undo_stack: VecDeque::new(),
+            brush_undo: BrushUndoStack::new(),
         }
     }
 
@@ -436,25 +428,17 @@ impl Simulation {
     }
 
     fn clear_undo(&mut self) {
-        self.in_progress_brush_strokes.clear();
-        self.undo_stack.clear();
+        self.brush_undo.clear();
     }
 
     fn finish_brush_unit(&mut self) {
-        if !self.in_progress_brush_strokes.is_empty() {
-            if self.undo_stack.len() == MAX_BRUSH_UNDO_UNITS {
-                self.undo_stack.pop_front();
-            }
-            self.undo_stack.push_back(BrushUndoUnit {
-                strokes: std::mem::take(&mut self.in_progress_brush_strokes),
-            });
-        }
+        self.brush_undo.finish_unit();
     }
 
     fn cancel_brush_unit(&mut self) {
         self.brush_down = false;
         self.last_brush_cell = None;
-        self.in_progress_brush_strokes.clear();
+        self.brush_undo.cancel_unit();
     }
 
     fn step_interval(&self) -> Duration {
@@ -1085,7 +1069,7 @@ impl GpuState {
                             }
                             if ui
                                 .add_enabled(
-                                    !simulation.undo_stack.is_empty(),
+                                    simulation.brush_undo.has_undo(),
                                     egui::Button::new("Undo brush"),
                                 )
                                 .clicked()
@@ -1171,10 +1155,10 @@ impl GpuState {
     }
 
     fn undo_brush(&mut self) {
-        let Some(unit) = self.simulation.undo_stack.pop_back() else {
+        let Some(strokes) = self.simulation.brush_undo.pop_undo_strokes() else {
             return;
         };
-        for stroke in unit.strokes.into_iter().rev() {
+        for stroke in strokes {
             self.simulation
                 .shaders_mut()
                 .undo_brush_stroke(&self.device, &self.queue, stroke);
@@ -1197,7 +1181,7 @@ impl GpuState {
 
         self.simulation.brush_down = down;
         if down {
-            self.simulation.in_progress_brush_strokes.clear();
+            self.simulation.brush_undo.begin_unit();
             self.paint_at_cursor();
         } else {
             self.simulation.last_brush_cell = None;
@@ -1225,7 +1209,7 @@ impl GpuState {
                 .shaders_mut()
                 .apply_brush_edits(&self.device, &self.queue, &edits)
         {
-            self.simulation.in_progress_brush_strokes.push(stroke);
+            self.simulation.brush_undo.record_stroke(stroke);
         }
     }
 

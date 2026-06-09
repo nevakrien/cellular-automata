@@ -1,9 +1,11 @@
+use std::collections::VecDeque;
 use std::sync::mpsc;
 
 use egui_wgpu::wgpu;
 use wgpu::util::DeviceExt;
 
 pub const MAX_BRUSH_EDITS: usize = 65_536*8;
+pub const MAX_BRUSH_UNDO_UNITS: usize = 50_000;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -26,6 +28,62 @@ impl BrushEdit {
 
 pub struct BrushStroke {
     edits: Vec<BrushEdit>,
+}
+
+struct BrushUndoUnit {
+    strokes: Vec<BrushStroke>,
+}
+
+#[derive(Default)]
+pub struct BrushUndoStack {
+    in_progress_strokes: Vec<BrushStroke>,
+    undo_units: VecDeque<BrushUndoUnit>,
+}
+
+impl BrushUndoStack {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.in_progress_strokes.clear();
+        self.undo_units.clear();
+    }
+
+    pub fn begin_unit(&mut self) {
+        self.in_progress_strokes.clear();
+    }
+
+    pub fn record_stroke(&mut self, stroke: BrushStroke) {
+        self.in_progress_strokes.push(stroke);
+    }
+
+    pub fn finish_unit(&mut self) {
+        if self.in_progress_strokes.is_empty() {
+            return;
+        }
+
+        if self.undo_units.len() == MAX_BRUSH_UNDO_UNITS {
+            self.undo_units.pop_front();
+        }
+        self.undo_units.push_back(BrushUndoUnit {
+            strokes: std::mem::take(&mut self.in_progress_strokes),
+        });
+    }
+
+    pub fn cancel_unit(&mut self) {
+        self.in_progress_strokes.clear();
+    }
+
+    pub fn has_undo(&self) -> bool {
+        !self.undo_units.is_empty()
+    }
+
+    pub fn pop_undo_strokes(&mut self) -> Option<Vec<BrushStroke>> {
+        let mut strokes = self.undo_units.pop_back()?.strokes;
+        strokes.reverse();
+        Some(strokes)
+    }
 }
 
 pub struct BrushGpu {
