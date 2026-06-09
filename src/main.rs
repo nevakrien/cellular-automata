@@ -985,9 +985,9 @@ impl GpuState {
                                     egui::ComboBox::from_id_salt("brush_value")
                                         .selected_text(match simulation.brush_value {
                                             0 => "Empty",
-                                            1 => "Rock",
+                                            3 => "Rock",
                                             2 => "Paper",
-                                            3 => "Scissors",
+                                            1 => "Scissors",
                                             _ => "Invalid",
                                         })
                                         .show_ui(ui, |ui| {
@@ -998,7 +998,7 @@ impl GpuState {
                                             );
                                             ui.selectable_value(
                                                 &mut simulation.brush_value,
-                                                1,
+                                                3,
                                                 "Rock",
                                             );
                                             ui.selectable_value(
@@ -1008,7 +1008,7 @@ impl GpuState {
                                             );
                                             ui.selectable_value(
                                                 &mut simulation.brush_value,
-                                                3,
+                                                1,
                                                 "Scissors",
                                             );
                                         });
